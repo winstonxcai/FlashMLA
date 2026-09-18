@@ -32,7 +32,7 @@ static constexpr int NUM_THREADS = 128*3;
 static constexpr int BLOCK_M = 64;
 static constexpr int TOPK_BLOCK_SIZE = 64;
 static constexpr int NUM_K_BUFS = 2;
-static constexpr int REMNANT_ROWS = CLUSTER_SIZE == 1 ? TOPK_BLOCK_SIZE : TOPK_BLOCK_SIZE / 2;
+static constexpr int REMNANT_ROWS = TOPK_BLOCK_SIZE / 2;
 
 using SmemLayoutQTile = decltype(tile_to_shape(
     GMMA::Layout_SW128_Atom<bf16, GMMA::Major::K>{},
@@ -103,8 +103,8 @@ struct SharedMemoryPlan {
     // Stage each packed row once. Four producer threads cooperatively load
     // the contiguous survivor bytes; the prefix table avoids repeated global
     // bitmap loads and prior-word popcounts during reconstruction.
-    // H64 processes two 32-token rounds in one CTA; clustered H128 CTAs each
-    // own one 32-token half. Keep only the rows local to this CTA.
+    // H64 processes two 32-token rounds in one CTA and H128 uses one 32-token
+    // half per clustered CTA. The scratch rows are reused between rounds.
     CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][REMNANT_ROWS * 256];
     CUTE_ALIGNAS(8) uint64_t remnant_bitmaps[NUM_K_BUFS][REMNANT_ROWS * 8];
     uint16_t remnant_rank_prefix[NUM_K_BUFS][REMNANT_ROWS * 9];

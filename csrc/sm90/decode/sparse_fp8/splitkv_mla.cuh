@@ -651,7 +651,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
                     const bool remnant_valid = token_index != -1 && raw_token_index >= 0;
-                    const int remnant_row_slot = (CLUSTER_SIZE == 1 ? idx_in_cluster*(TOPK_BLOCK_SIZE/2) : 0) + my_token_idx;
+                    const int remnant_row_slot = my_token_idx % (TOPK_BLOCK_SIZE / 2);
 
                     fp8* gK_base = nullptr;
                     bf16 scales[NUM_SCALES];
