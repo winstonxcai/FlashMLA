@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "cutlass/bfloat16.h"
 
 enum class ModelType {
@@ -81,6 +83,19 @@ struct SparseAttnDecodeParams {
     cutlass::bfloat16_t* __restrict__ extra_kv;  // [extra_num_blocks, extra_page_block_size, d_qk]
     int* __restrict__ extra_indices;   // [b, s_q, extra_topk]
     int* __restrict__ extra_topk_length;  // [b], may be nullptr
+
+    // Remnant's persistent C4 records. These are used only by the dedicated
+    // SM90 MODEL1 entry point; the stock extra_kv ABI remains unchanged.
+    uint8_t* __restrict__ remnant_values;   // [pages, page_size, 256]
+    uint64_t* __restrict__ remnant_bitmaps; // [pages, page_size, 8]
+    uint8_t* __restrict__ remnant_scales;   // [pages, page_size, 8]
+    int* __restrict__ remnant_raw_indices;  // [b, s_q, extra_topk]
+    float* __restrict__ remnant_freqs;      // [position*4*32 + pair, real/imag]
+    int remnant_num_pages, remnant_page_size;
+    int stride_remnant_values_page, stride_remnant_values_row;
+    int stride_remnant_bitmaps_page, stride_remnant_bitmaps_row;
+    int stride_remnant_scales_page, stride_remnant_scales_row;
+    int stride_remnant_raw_indices_b, stride_remnant_raw_indices_s_q;
     
     int stride_q_b, stride_q_s_q, stride_q_h_q;
     int stride_kv_block, stride_kv_row;

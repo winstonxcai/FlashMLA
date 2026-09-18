@@ -24,6 +24,58 @@ using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using fp8_e8m0 = __nv_fp8_e8m0;
 
+__device__ __forceinline__ fp8x8 load_remnant_fp8x8(
+    const SparseAttnDecodeParams &params,
+    int block_index,
+    int row_index,
+    int dim_base,
+    bool valid
+) {
+    fp8x8 result;
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    const uint64_t *bitmap = params.remnant_bitmaps
+        + block_index * params.stride_remnant_bitmaps_page
+        + row_index * params.stride_remnant_bitmaps_row;
+    const uint8_t *values = params.remnant_values
+        + block_index * params.stride_remnant_values_page
+        + row_index * params.stride_remnant_values_row;
+    const int word = dim_base / 64;
+    const uint64_t keep = valid ? __ldg(bitmap + word) : 0;
+    for (int i = 0; i < 8; ++i) {
+        const int bit = dim_base + i;
+        const int lane = bit & 63;
+        const uint64_t prior_mask = lane == 0 ? 0ULL : (~0ULL << (64 - lane));
+        const bool kept = ((keep >> (63 - lane)) & 1ULL) != 0;
+        int rank = 0;
+        for (int prior_word = 0; prior_word < word; ++prior_word)
+            rank += __popcll(valid ? __ldg(bitmap + prior_word) : 0ULL);
+        rank += __popcll(keep & prior_mask);
+        const uint8_t code = kept ? __ldg(values + rank) : 0;
+        if (i < 4)
+            reinterpret_cast<uint8_t*>(&lo)[i] = code;
+        else
+            reinterpret_cast<uint8_t*>(&hi)[i - 4] = code;
+    }
+    *reinterpret_cast<uint32_t*>(&result.lo) = lo;
+    *reinterpret_cast<uint32_t*>(&result.hi) = hi;
+    return result;
+}
+
+__device__ __forceinline__ bf16 remnant_scale(
+    const SparseAttnDecodeParams &params,
+    int block_index,
+    int row_index,
+    int word,
+    bool valid
+) {
+    const uint8_t *scales = params.remnant_scales
+        + block_index * params.stride_remnant_scales_page
+        + row_index * params.stride_remnant_scales_row;
+    const int code = valid ? static_cast<int>(__ldg(scales + word)) : 0;
+    return (bf16)__int_as_float(code << 23);
+}
+
 template<
     typename Tensor0,
     typename Tensor1,
@@ -83,9 +135,9 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
 template<typename TMAParams>
-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
@@ -467,8 +519,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             MainloopArgs args = get_cur_req_info(batch_idx);
             int* gIndices = params.indices + batch_idx*params.stride_indices_b + s_q_idx*params.stride_indices_s_q; // (topk) : (1)
             int* gExtraIndices = params.extra_indices + batch_idx*params.stride_extra_indices_b + s_q_idx*params.stride_extra_indices_s_q; // (extra_topk) : (1)
+            int* gExtraRawIndices = nullptr;
+            if constexpr (REMNANT) {
+                gExtraRawIndices = params.remnant_raw_indices + batch_idx*params.stride_remnant_raw_indices_b + s_q_idx*params.stride_remnant_raw_indices_s_q;
+            }
             
             int nxt_token_indexs[NUM_TOKENS_PER_THREAD];
+            int nxt_raw_token_indices[NUM_TOKENS_PER_THREAD];
             CUTE_UNROLL
             for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
                 if (MODEL_TYPE == ModelType::V32 || args.start_block_idx < args.num_orig_kv_blocks)
@@ -497,7 +554,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     k_ptr = (fp8*)params.kv;
                 } else {
                     indices_base = gExtraIndices + (block_idx-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE;
-                    page_block_size = params.extra_page_block_size;
+                    page_block_size = REMNANT ? params.remnant_page_size : params.extra_page_block_size;
                     k_block_stride = params.stride_extra_kv_block;
                     k_row_stride = params.stride_extra_kv_row;
                     k_ptr = (fp8*)params.extra_kv;
@@ -514,6 +571,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     // Get prefetched token index
                     int token_index;
+                    int raw_token_index = -1;
                     if constexpr (!IS_EXTRA_BLOCK) {
                         token_index = nxt_token_indexs[round];
                         if (block_idx+1 != (MODEL_TYPE == ModelType::V32 ? args.end_block_idx : args.num_orig_kv_blocks))
@@ -521,26 +579,38 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     } else {
                         if constexpr (IS_FIRST_EXTRA_BLOCK) {
                             token_index = __ldg(gExtraIndices + (block_idx-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
+                            if constexpr (REMNANT)
+                                raw_token_index = __ldg(gExtraRawIndices + (block_idx-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
                         } else {
                             token_index = nxt_token_indexs[round];
+                            if constexpr (REMNANT)
+                                raw_token_index = nxt_raw_token_indices[round];
                         }
-                        if (block_idx+1 != args.end_block_idx)
+                        if (block_idx+1 != args.end_block_idx) {
                             nxt_token_indexs[round] = __ldg(gExtraIndices + (block_idx+1-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
+                            if constexpr (REMNANT)
+                                nxt_raw_token_indices[round] = __ldg(gExtraRawIndices + (block_idx+1-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
+                        }
                     }
                     
                     if constexpr (MODEL_TYPE == ModelType::MODEL1) {
                         // For MODEL1, we need to check whether the token_index is within topk_length
                         if (rel_block_idx*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx >= topk_length) {
                             token_index = -1;   // To prevent IMA when we have invalid (e.g. INT_MAX) topk indexes outside topk_length
+                            if constexpr (REMNANT)
+                                raw_token_index = -1;
                         }
                     }
 
                     int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
-                    fp8* gK_base;
+                    fp8* gK_base = nullptr;
                     bf16 scales[NUM_SCALES];
-                    if constexpr (MODEL_TYPE == ModelType::V32) {
+                    if constexpr (REMNANT && MODEL_TYPE == ModelType::MODEL1 && IS_EXTRA_BLOCK) {
+                        // The Remnant entry point reads the persistent 328-byte
+                        // record directly. No dense extra_kv row is formed.
+                    } else if constexpr (MODEL_TYPE == ModelType::V32) {
                         static_assert(NUM_SCALES == 4);
                         gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride;
                         float scales_float[NUM_SCALES];
@@ -570,9 +640,74 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
                     }
 
+                    bf16* sK_rope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
+                    bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
+
                     // Collectively copy from global memory and dequant
                     // For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
-                    
+                    if constexpr (REMNANT && MODEL_TYPE == ModelType::MODEL1 && IS_EXTRA_BLOCK) {
+                        const bool valid = token_index != -1 && raw_token_index >= 0;
+                        const int value_base_dim = (lane_idx / 8) * 16;
+                        const int packed_page = valid ? block_index : 0;
+                        const int packed_row = valid ? rel_idx_in_block : 0;
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE / 64; ++dim_idx) {
+                            const int dim_base = dim_idx * 64 + value_base_dim;
+                            fp8x8 first = load_remnant_fp8x8(params, packed_page, packed_row, dim_base, valid);
+                            fp8x8 second = load_remnant_fp8x8(params, packed_page, packed_row, dim_base + 8, valid);
+                            bf16 scale = remnant_scale(params, packed_page, packed_row, dim_idx, valid);
+                            bf16x8 first_bf16 = cvt_fp8x8_bf16x8(first, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            bf16x8 second_bf16 = cvt_fp8x8_bf16x8(second, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            if (!valid) {
+                                *(uint128_t*)(&first_bf16) = uint128_t();
+                                *(uint128_t*)(&second_bf16) = uint128_t();
+                            }
+                            int smem_offset = (dim_idx * 64) * TOPK_BLOCK_SIZE;
+                            *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&first_bf16;
+                            *(__int128_t*)(sK_nope_base + smem_offset + 8 * TOPK_BLOCK_SIZE) = *(__int128_t*)&second_bf16;
+                            if constexpr (CLUSTER_SIZE == 2) {
+                                st_async_128b(sK_nope_peer_base + smem_offset, first_bf16, peer_bar_k_remote_ready);
+                                st_async_128b(sK_nope_peer_base + smem_offset + 8 * TOPK_BLOCK_SIZE, second_bf16, peer_bar_k_remote_ready);
+                            }
+                        }
+
+                        // The packed record contains the unrotated tail. Apply
+                        // the model's four-position RoPE stride before storing it.
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE / 32; ++dim_idx) {
+                            const int rope_base_dim = (lane_idx / 8) * 8;
+                            const int dim_base = HEAD_DIM_NOPE + dim_idx * 32 + rope_base_dim;
+                            fp8x8 first = load_remnant_fp8x8(params, packed_page, packed_row, dim_base, valid);
+                            bf16 scale = remnant_scale(params, packed_page, packed_row, 7, valid);
+                            bf16x8 cur = cvt_fp8x8_bf16x8(first, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            float values[8] = {
+                                (float)cur.a01.x, (float)cur.a01.y,
+                                (float)cur.a23.x, (float)cur.a23.y,
+                                (float)cur.a45.x, (float)cur.a45.y,
+                                (float)cur.a67.x, (float)cur.a67.y,
+                            };
+                            if (valid) {
+                                for (int pair = 0; pair < 4; ++pair) {
+                                    const int freq = raw_token_index * 4 * 32 + dim_idx * 16 + (rope_base_dim + pair * 2) / 2;
+                                    const float c = __ldg(params.remnant_freqs + freq * 2);
+                                    const float s = __ldg(params.remnant_freqs + freq * 2 + 1);
+                                    const float x0 = values[pair * 2];
+                                    const float x1 = values[pair * 2 + 1];
+                                    values[pair * 2] = x0 * c - x1 * s;
+                                    values[pair * 2 + 1] = x0 * s + x1 * c;
+                                }
+                            } else {
+                                for (int i = 0; i < 8; ++i)
+                                    values[i] = 0.0f;
+                            }
+                            cur.a01 = __float22bfloat162_rn({values[0], values[1]});
+                            cur.a23 = __float22bfloat162_rn({values[2], values[3]});
+                            cur.a45 = __float22bfloat162_rn({values[4], values[5]});
+                            cur.a67 = __float22bfloat162_rn({values[6], values[7]});
+                            const int smem_offset = (HEAD_DIM_NOPE + dim_idx * 32) * TOPK_BLOCK_SIZE;
+                            *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&cur;
+                            if constexpr (CLUSTER_SIZE == 2)
+                                st_async_128b(sK_rope_peer_base + smem_offset, cur, peer_bar_k_remote_ready);
+                        }
+                    } else {
                     fp8* gK_nope = gK_base + (lane_idx/8)*16;
                     if (token_index == -1) {
                         CUTE_UNROLL
@@ -603,9 +738,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     } else {
                         gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE) + (lane_idx/8)*8;
                     }
-                    bf16* sK_rope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
-                    bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
-
                     CUTE_UNROLL
                     for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
                         bf16x8 cur_bf16x8 = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(gK_rope + dim_idx*32);
@@ -620,6 +752,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         if constexpr (CLUSTER_SIZE == 2) {
                             st_async_128b(sK_rope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
                         }
+                    }
                     }
                 }
 
@@ -683,8 +816,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     Kernel::devfunc(params, tma_params);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
-void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &params) {
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
+void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
     KU_ASSERT(params.d_qk == HEAD_DIM_K);
@@ -748,7 +881,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         shape_Q, tma_Q,
         tensor_map_o
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -779,9 +912,9 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
 void run_flash_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams &params) {
-    KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(params);
+    KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(params);
 }
 
 }

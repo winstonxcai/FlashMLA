@@ -75,6 +75,36 @@ protected:
     }
 };
 
+class Decode_Sm90_Remnant_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_64,
+        DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::MODEL1_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_TOPK_LENGTH
+    )
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q / (h_q / 64), 1),
+            5,
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
+            sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<
+                ModelType::MODEL1, NUM_HEADS, true>(params);
+        });
+    }
+};
+
 class Decode_Sm100_Head64_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
@@ -180,8 +210,9 @@ protected:
     }
 };
 
+template<bool REMNANT>
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
-sparse_attn_decode_interface(
+sparse_attn_decode_interface_impl(
     const at::Tensor &q,   // [b, s_q, h_q, d_qk]
     const at::Tensor &kv,   // [num_blocks, page_block_size, h_k, d_qk]
     const at::Tensor &indices,    // [b, s_q, topk]
@@ -193,7 +224,12 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &extra_indices,
     const std::optional<at::Tensor> &extra_topk_length,
     int d_v,
-    float sm_scale
+    float sm_scale,
+    const std::optional<at::Tensor> &remnant_values,
+    const std::optional<at::Tensor> &remnant_bitmaps,
+    const std::optional<at::Tensor> &remnant_scales,
+    const std::optional<at::Tensor> &remnant_raw_indices,
+    const std::optional<at::Tensor> &remnant_freqs
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -215,16 +251,41 @@ sparse_attn_decode_interface(
 
     bool have_topk_length = topk_length.has_value();
     bool have_extra_kcache = extra_kv.has_value();
+    bool have_remnant = remnant_values.has_value();
     bool have_extra_topk_length = extra_topk_length.has_value();
     bool have_attn_sink = attn_sink.has_value();
 
     int extra_num_blocks = 0, extra_page_block_size = 0, extra_topk = 0;
+    int remnant_num_pages = 0, remnant_page_size = 0;
+    if constexpr (REMNANT) {
+        TORCH_CHECK(d_qk == 512, "Remnant C4 decode requires MODEL1 head_size_k == 512");
+        TORCH_CHECK(!have_extra_kcache, "Remnant C4 decode does not accept a dense extra_kv tensor");
+        TORCH_CHECK(remnant_values.has_value() && remnant_bitmaps.has_value() && remnant_scales.has_value(), "Remnant C4 decode requires values, bitmaps, and scales");
+        TORCH_CHECK(remnant_raw_indices.has_value() && remnant_freqs.has_value(), "Remnant C4 decode requires raw indices and RoPE frequencies");
+        TORCH_CHECK(extra_indices.has_value() && extra_topk_length.has_value(), "Remnant C4 decode requires physical indices and topk lengths");
+    } else {
+        TORCH_CHECK(!have_remnant, "Remnant buffers require the dedicated Remnant decode entry point");
+    }
+
     if (have_extra_kcache) {
         extra_num_blocks = extra_kv->size(0);
         extra_page_block_size = extra_kv->size(1);
     }
     if (extra_indices.has_value()) {
         extra_topk = extra_indices->size(-1);
+    }
+    if constexpr (REMNANT) {
+        KU_CHECK_NDIM(remnant_values, 3);
+        KU_CHECK_NDIM(remnant_bitmaps, 3);
+        KU_CHECK_NDIM(remnant_scales, 3);
+        KU_CHECK_NDIM(remnant_raw_indices, 3);
+        KU_CHECK_NDIM(remnant_freqs, 3);
+        remnant_num_pages = remnant_values->size(0);
+        remnant_page_size = remnant_values->size(1);
+        TORCH_CHECK(remnant_values->size(2) == 256, "Remnant values must have 256 codes per row");
+        TORCH_CHECK(remnant_bitmaps->size(0) == remnant_num_pages && remnant_bitmaps->size(1) == remnant_page_size && remnant_bitmaps->size(2) == 8, "Remnant bitmap shape must be [pages, page_size, 8]");
+        TORCH_CHECK(remnant_scales->size(0) == remnant_num_pages && remnant_scales->size(1) == remnant_page_size && remnant_scales->size(2) == 8, "Remnant scale shape must be [pages, page_size, 8]");
+        TORCH_CHECK(remnant_freqs->size(2) == 2, "Remnant frequencies must have real/imag pairs");
     }
 
     // metadata sanity check
@@ -238,7 +299,7 @@ sparse_attn_decode_interface(
 
     if (have_extra_kcache) {
         TORCH_CHECK(extra_indices.has_value(), "extra_indices_in_kvcache must be provided when extra_kcache is provided for sparse attention");
-    } else {
+    } else if constexpr (!REMNANT) {
         TORCH_CHECK(!extra_indices.has_value(), "extra_indices_in_kvcache must not be provided when extra_k_cache is not provided");
         TORCH_CHECK(!extra_topk_length.has_value(), "extra_topk_length must not be provided when extra_k_cache is not provided");
     }
@@ -254,6 +315,11 @@ sparse_attn_decode_interface(
     KU_CHECK_DEVICE(extra_kv);
     KU_CHECK_DEVICE(extra_indices);
     KU_CHECK_DEVICE(extra_topk_length);
+    KU_CHECK_DEVICE(remnant_values);
+    KU_CHECK_DEVICE(remnant_bitmaps);
+    KU_CHECK_DEVICE(remnant_scales);
+    KU_CHECK_DEVICE(remnant_raw_indices);
+    KU_CHECK_DEVICE(remnant_freqs);
 
     // Check data type
     KU_CHECK_DTYPE(q, torch::kBFloat16);
@@ -268,6 +334,11 @@ sparse_attn_decode_interface(
     KU_CHECK_DTYPE(num_splits, torch::kInt32);
     KU_CHECK_DTYPE(extra_indices, torch::kInt32);
     KU_CHECK_DTYPE(extra_topk_length, torch::kInt32);
+    KU_CHECK_DTYPE(remnant_values, torch::kUInt8);
+    KU_CHECK_DTYPE(remnant_bitmaps, torch::kUInt64);
+    KU_CHECK_DTYPE(remnant_scales, torch::kUInt8);
+    KU_CHECK_DTYPE(remnant_raw_indices, torch::kInt32);
+    KU_CHECK_DTYPE(remnant_freqs, torch::kFloat32);
     
     // Check layout
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
@@ -282,6 +353,11 @@ sparse_attn_decode_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_indices);
     KU_CHECK_CONTIGUOUS(extra_topk_length);
+    KU_CHECK_CONTIGUOUS(remnant_values);
+    KU_CHECK_CONTIGUOUS(remnant_bitmaps);
+    KU_CHECK_CONTIGUOUS(remnant_scales);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(remnant_raw_indices);
+    KU_CHECK_CONTIGUOUS(remnant_freqs);
     
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
@@ -308,6 +384,10 @@ sparse_attn_decode_interface(
     KU_CHECK_SHAPE(attn_sink, h_q);
     KU_CHECK_SHAPE(extra_indices, b, s_q, extra_topk);
     KU_CHECK_SHAPE(extra_topk_length, b);
+    if constexpr (REMNANT) {
+        KU_CHECK_SHAPE(remnant_raw_indices, b, s_q, extra_topk);
+        TORCH_CHECK(remnant_values->stride(2) == 1 && remnant_bitmaps->stride(2) == 1 && remnant_scales->stride(2) == 1, "Remnant records must be row-contiguous");
+    }
 
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
@@ -360,7 +440,10 @@ sparse_attn_decode_interface(
     }
 
     DecodeImplBase* impl;
-    if (arch.is_sm100f()) {
+    if constexpr (REMNANT) {
+        TORCH_CHECK(arch.is_sm90a(), "Remnant direct decode currently requires SM90a");
+        impl = new Decode_Sm90_Remnant_Impl();
+    } else if (arch.is_sm100f()) {
         if (h_q == 64) {
             impl = new Decode_Sm100_Head64_Impl();
         } else if (h_q == 128) {
@@ -401,6 +484,10 @@ sparse_attn_decode_interface(
         ku::get_optional_tensor_ptr<int>(extra_indices),
         ku::get_optional_tensor_ptr<int>(extra_topk_length),
 
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+
         int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)), int64_stride_to_int(q.stride(2)),
         int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
         int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
@@ -409,10 +496,28 @@ sparse_attn_decode_interface(
 
         have_extra_kcache ? int64_stride_to_int(extra_kv->stride(0)) : 0,
         have_extra_kcache ? int64_stride_to_int(extra_kv->stride(1)) : 0,
-        have_extra_kcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
-        have_extra_kcache ? int64_stride_to_int(extra_indices->stride(1)) : 0,
+        extra_indices.has_value() ? int64_stride_to_int(extra_indices->stride(0)) : 0,
+        extra_indices.has_value() ? int64_stride_to_int(extra_indices->stride(1)) : 0,
         at::cuda::getCurrentCUDAStream().stream()
     };
+
+    if constexpr (REMNANT) {
+        params.remnant_values = remnant_values->data_ptr<uint8_t>();
+        params.remnant_bitmaps = remnant_bitmaps->data_ptr<uint64_t>();
+        params.remnant_scales = remnant_scales->data_ptr<uint8_t>();
+        params.remnant_raw_indices = remnant_raw_indices->data_ptr<int>();
+        params.remnant_freqs = remnant_freqs->data_ptr<float>();
+        params.remnant_num_pages = remnant_num_pages;
+        params.remnant_page_size = remnant_page_size;
+        params.stride_remnant_values_page = int64_stride_to_int(remnant_values->stride(0));
+        params.stride_remnant_values_row = int64_stride_to_int(remnant_values->stride(1));
+        params.stride_remnant_bitmaps_page = int64_stride_to_int(remnant_bitmaps->stride(0));
+        params.stride_remnant_bitmaps_row = int64_stride_to_int(remnant_bitmaps->stride(1));
+        params.stride_remnant_scales_page = int64_stride_to_int(remnant_scales->stride(0));
+        params.stride_remnant_scales_row = int64_stride_to_int(remnant_scales->stride(1));
+        params.stride_remnant_raw_indices_b = int64_stride_to_int(remnant_raw_indices->stride(0));
+        params.stride_remnant_raw_indices_s_q = int64_stride_to_int(remnant_raw_indices->stride(1));
+    }
 
     // Get MLA metadata if necessary
     at::Tensor o_accum, lse_accum;
@@ -492,4 +597,51 @@ sparse_attn_decode_interface(
     delete impl;
 
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
+}
+
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &attn_sink,
+    std::optional<at::Tensor> &tile_scheduler_metadata,
+    std::optional<at::Tensor> &num_splits,
+    const std::optional<at::Tensor> &extra_kv,
+    const std::optional<at::Tensor> &extra_indices,
+    const std::optional<at::Tensor> &extra_topk_length,
+    int d_v,
+    float sm_scale
+) {
+    return sparse_attn_decode_interface_impl<false>(
+        q, kv, indices, topk_length, attn_sink, tile_scheduler_metadata,
+        num_splits, extra_kv, extra_indices, extra_topk_length, d_v, sm_scale,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+}
+
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_remnant_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &attn_sink,
+    std::optional<at::Tensor> &tile_scheduler_metadata,
+    std::optional<at::Tensor> &num_splits,
+    const std::optional<at::Tensor> &extra_indices,
+    const std::optional<at::Tensor> &extra_topk_length,
+    const at::Tensor &remnant_values,
+    const at::Tensor &remnant_bitmaps,
+    const at::Tensor &remnant_scales,
+    const at::Tensor &remnant_raw_indices,
+    const at::Tensor &remnant_freqs,
+    int d_v,
+    float sm_scale
+) {
+    return sparse_attn_decode_interface_impl<true>(
+        q, kv, indices, topk_length, attn_sink, tile_scheduler_metadata,
+        num_splits, std::nullopt, extra_indices, extra_topk_length, d_v, sm_scale,
+        remnant_values, remnant_bitmaps, remnant_scales, remnant_raw_indices,
+        remnant_freqs);
 }
