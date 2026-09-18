@@ -102,10 +102,13 @@ struct SharedMemoryPlan {
     // Stage each packed row once. Four producer threads cooperatively load
     // the contiguous survivor bytes; the prefix table avoids repeated global
     // bitmap loads and prior-word popcounts during reconstruction.
-    CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][TOPK_BLOCK_SIZE * 256];
-    CUTE_ALIGNAS(8) uint64_t remnant_bitmaps[NUM_K_BUFS][TOPK_BLOCK_SIZE * 8];
-    uint16_t remnant_rank_prefix[NUM_K_BUFS][TOPK_BLOCK_SIZE * 9];
-    uint8_t remnant_scales[NUM_K_BUFS][TOPK_BLOCK_SIZE * 8];
+    // Each cluster block owns half of the 64-token top-k tile.  Keeping the
+    // staging rows at the per-block extent avoids exceeding SM90's dynamic
+    // shared-memory limit while retaining one packed row load per token.
+    CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][(TOPK_BLOCK_SIZE / 2) * 256];
+    CUTE_ALIGNAS(8) uint64_t remnant_bitmaps[NUM_K_BUFS][(TOPK_BLOCK_SIZE / 2) * 8];
+    uint16_t remnant_rank_prefix[NUM_K_BUFS][(TOPK_BLOCK_SIZE / 2) * 9];
+    uint8_t remnant_scales[NUM_K_BUFS][(TOPK_BLOCK_SIZE / 2) * 8];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
 };
 
