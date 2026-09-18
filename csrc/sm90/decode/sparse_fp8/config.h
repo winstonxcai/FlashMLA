@@ -32,6 +32,7 @@ static constexpr int NUM_THREADS = 128*3;
 static constexpr int BLOCK_M = 64;
 static constexpr int TOPK_BLOCK_SIZE = 64;
 static constexpr int NUM_K_BUFS = 2;
+static constexpr int REMNANT_ROWS = CLUSTER_SIZE == 1 ? TOPK_BLOCK_SIZE : TOPK_BLOCK_SIZE / 2;
 
 using SmemLayoutQTile = decltype(tile_to_shape(
     GMMA::Layout_SW128_Atom<bf16, GMMA::Major::K>{},
@@ -102,13 +103,12 @@ struct SharedMemoryPlan {
     // Stage each packed row once. Four producer threads cooperatively load
     // the contiguous survivor bytes; the prefix table avoids repeated global
     // bitmap loads and prior-word popcounts during reconstruction.
-    // Each cluster block owns half of the 64-token top-k tile.  Keeping the
-    // staging rows at the per-block extent avoids exceeding SM90's dynamic
-    // shared-memory limit while retaining one packed row load per token.
-    CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][(TOPK_BLOCK_SIZE / 2) * 256];
-    CUTE_ALIGNAS(8) uint64_t remnant_bitmaps[NUM_K_BUFS][(TOPK_BLOCK_SIZE / 2) * 8];
-    uint16_t remnant_rank_prefix[NUM_K_BUFS][(TOPK_BLOCK_SIZE / 2) * 9];
-    uint8_t remnant_scales[NUM_K_BUFS][(TOPK_BLOCK_SIZE / 2) * 8];
+    // H64 processes two 32-token rounds in one CTA; clustered H128 CTAs each
+    // own one 32-token half. Keep only the rows local to this CTA.
+    CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][REMNANT_ROWS * 256];
+    CUTE_ALIGNAS(8) uint64_t remnant_bitmaps[NUM_K_BUFS][REMNANT_ROWS * 8];
+    uint16_t remnant_rank_prefix[NUM_K_BUFS][REMNANT_ROWS * 9];
+    uint8_t remnant_scales[NUM_K_BUFS][REMNANT_ROWS * 8];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
 };
 
