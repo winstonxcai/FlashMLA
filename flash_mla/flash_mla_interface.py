@@ -211,6 +211,57 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_with_remnant_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    remnant_buffers: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    remnant_raw_indices: torch.Tensor,
+    remnant_freqs: torch.Tensor,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    sm_scale: Optional[float] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    d_v: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Decode the persistent Remnant C4 record directly on SM90.
+
+    ``k_cache`` and ``indices`` carry the ordinary sparse region. The C4
+    region is described by physical ``extra_indices_in_kvcache`` and the
+    matching raw token positions. This wrapper intentionally stays separate
+    from ``flash_mla_with_kvcache`` so the stock API and Native path remain
+    unchanged.
+    """
+    if sm_scale is None:
+        sm_scale = q.shape[-1] ** (-0.5)
+    assert isinstance(tile_scheduler_metadata, FlashMLASchedMeta)
+    assert extra_indices_in_kvcache is not None
+    values, bitmaps, scales = remnant_buffers
+    out, lse, new_metadata, new_splits = flash_mla_cuda.remnant_sparse_decode_fwd(
+        q,
+        k_cache,
+        indices,
+        topk_length,
+        attn_sink,
+        tile_scheduler_metadata.tile_scheduler_metadata,
+        tile_scheduler_metadata.num_splits,
+        extra_indices_in_kvcache,
+        extra_topk_length,
+        values,
+        bitmaps,
+        scales,
+        remnant_raw_indices,
+        remnant_freqs,
+        d_v,
+        sm_scale,
+    )
+    tile_scheduler_metadata.tile_scheduler_metadata = new_metadata
+    tile_scheduler_metadata.num_splits = new_splits
+    return out, lse
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,

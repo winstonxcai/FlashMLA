@@ -24,34 +24,78 @@ using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using fp8_e8m0 = __nv_fp8_e8m0;
 
-__device__ __forceinline__ fp8x8 load_remnant_fp8x8(
+__device__ __forceinline__ void prepare_remnant_row(
     const SparseAttnDecodeParams &params,
+    SharedMemoryPlan &plan,
+    int buf_idx,
+    int row_slot,
     int block_index,
     int row_index,
+    bool valid,
+    int lane_idx
+) {
+    const int value_group = lane_idx >> 3;
+    uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 256;
+
+    // Four threads associated with one token each load a contiguous 64-byte
+    // survivor range. The packed record is therefore read once with 128-bit
+    // transactions before logical-coordinate reconstruction begins.
+    if (valid) {
+        const uint8_t *gvalues = params.remnant_values
+            + block_index * params.stride_remnant_values_page
+            + row_index * params.stride_remnant_values_row;
+        for (int offset = 0; offset < 64; offset += 16) {
+            uint4 chunk = __ldg(reinterpret_cast<const uint4 *>(gvalues + value_group * 64 + offset));
+            *reinterpret_cast<uint4 *>(values + value_group * 64 + offset) = chunk;
+        }
+    }
+
+    // One thread per token loads the bitmap and scale metadata and computes
+    // the word prefix counts shared by the four survivor-loading threads.
+    if (value_group == 0) {
+        uint64_t *bitmap = plan.remnant_bitmaps[buf_idx] + row_slot * 8;
+        uint16_t *prefix = plan.remnant_rank_prefix[buf_idx] + row_slot * 9;
+        uint8_t *scales = plan.remnant_scales[buf_idx] + row_slot * 8;
+        const uint64_t *gbitmap = params.remnant_bitmaps
+            + block_index * params.stride_remnant_bitmaps_page
+            + row_index * params.stride_remnant_bitmaps_row;
+        const uint8_t *gscales = params.remnant_scales
+            + block_index * params.stride_remnant_scales_page
+            + row_index * params.stride_remnant_scales_row;
+        prefix[0] = 0;
+        for (int word = 0; word < 8; ++word) {
+            uint64_t bits = valid ? __ldg(gbitmap + word) : 0ULL;
+            bitmap[word] = bits;
+            scales[word] = valid ? __ldg(gscales + word) : 0;
+            prefix[word + 1] = prefix[word] + __popcll(bits);
+        }
+    }
+    __syncwarp();
+}
+
+__device__ __forceinline__ fp8x8 load_remnant_fp8x8(
+    const SharedMemoryPlan &plan,
+    int buf_idx,
+    int row_slot,
     int dim_base,
     bool valid
 ) {
     fp8x8 result;
     uint32_t lo = 0;
     uint32_t hi = 0;
-    const uint64_t *bitmap = params.remnant_bitmaps
-        + block_index * params.stride_remnant_bitmaps_page
-        + row_index * params.stride_remnant_bitmaps_row;
-    const uint8_t *values = params.remnant_values
-        + block_index * params.stride_remnant_values_page
-        + row_index * params.stride_remnant_values_row;
+    const uint64_t *bitmap = plan.remnant_bitmaps[buf_idx] + row_slot * 8;
+    const uint16_t *prefix = plan.remnant_rank_prefix[buf_idx] + row_slot * 9;
+    const uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 256;
     const int word = dim_base / 64;
-    const uint64_t keep = valid ? __ldg(bitmap + word) : 0;
+    const uint64_t keep = valid ? bitmap[word] : 0;
+    const int rank_base = prefix[word];
     for (int i = 0; i < 8; ++i) {
         const int bit = dim_base + i;
         const int lane = bit & 63;
         const uint64_t prior_mask = lane == 0 ? 0ULL : (~0ULL << (64 - lane));
         const bool kept = ((keep >> (63 - lane)) & 1ULL) != 0;
-        int rank = 0;
-        for (int prior_word = 0; prior_word < word; ++prior_word)
-            rank += __popcll(valid ? __ldg(bitmap + prior_word) : 0ULL);
-        rank += __popcll(keep & prior_mask);
-        const uint8_t code = kept ? __ldg(values + rank) : 0;
+        const int rank = rank_base + __popcll(keep & prior_mask);
+        const uint8_t code = valid && kept ? values[rank] : 0;
         if (i < 4)
             reinterpret_cast<uint8_t*>(&lo)[i] = code;
         else
@@ -63,16 +107,14 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
 }
 
 __device__ __forceinline__ bf16 remnant_scale(
-    const SparseAttnDecodeParams &params,
-    int block_index,
-    int row_index,
+    const SharedMemoryPlan &plan,
+    int buf_idx,
+    int row_slot,
     int word,
     bool valid
 ) {
-    const uint8_t *scales = params.remnant_scales
-        + block_index * params.stride_remnant_scales_page
-        + row_index * params.stride_remnant_scales_row;
-    const int code = valid ? static_cast<int>(__ldg(scales + word)) : 0;
+    const uint8_t *scales = plan.remnant_scales[buf_idx] + row_slot * 8;
+    const int code = valid ? static_cast<int>(scales[word]) : 0;
     return (bf16)__int_as_float(code << 23);
 }
 
@@ -605,6 +647,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                     int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
+                    const bool remnant_valid = token_index != -1 && raw_token_index >= 0;
+                    const int remnant_row_slot = idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx;
+
                     fp8* gK_base = nullptr;
                     bf16 scales[NUM_SCALES];
                     if constexpr (REMNANT && MODEL_TYPE == ModelType::MODEL1 && IS_EXTRA_BLOCK) {
@@ -635,6 +680,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                     if (round == 0) {
                         plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
                     }
+
+                    if constexpr (REMNANT && MODEL_TYPE == ModelType::MODEL1 && IS_EXTRA_BLOCK) {
+                        const int packed_page = remnant_valid ? block_index : 0;
+                        const int packed_row = remnant_valid ? rel_idx_in_block : 0;
+                        prepare_remnant_row(
+                            params, plan, buf_idx, remnant_row_slot,
+                            packed_page, packed_row, remnant_valid, lane_idx
+                        );
+                    }
                     
                     if (CLUSTER_SIZE == 2 && round == 0 && idx_in_warpgroup == 0) {
                         plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
@@ -652,9 +706,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                         const int packed_row = valid ? rel_idx_in_block : 0;
                         for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE / 64; ++dim_idx) {
                             const int dim_base = dim_idx * 64 + value_base_dim;
-                            fp8x8 first = load_remnant_fp8x8(params, packed_page, packed_row, dim_base, valid);
-                            fp8x8 second = load_remnant_fp8x8(params, packed_page, packed_row, dim_base + 8, valid);
-                            bf16 scale = remnant_scale(params, packed_page, packed_row, dim_idx, valid);
+                            fp8x8 first = load_remnant_fp8x8(plan, buf_idx, remnant_row_slot, dim_base, valid);
+                            fp8x8 second = load_remnant_fp8x8(plan, buf_idx, remnant_row_slot, dim_base + 8, valid);
+                            bf16 scale = remnant_scale(plan, buf_idx, remnant_row_slot, dim_idx, valid);
                             bf16x8 first_bf16 = cvt_fp8x8_bf16x8(first, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
                             bf16x8 second_bf16 = cvt_fp8x8_bf16x8(second, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
                             if (!valid) {
@@ -675,8 +729,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                         for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE / 32; ++dim_idx) {
                             const int rope_base_dim = (lane_idx / 8) * 8;
                             const int dim_base = HEAD_DIM_NOPE + dim_idx * 32 + rope_base_dim;
-                            fp8x8 first = load_remnant_fp8x8(params, packed_page, packed_row, dim_base, valid);
-                            bf16 scale = remnant_scale(params, packed_page, packed_row, 7, valid);
+                            fp8x8 first = load_remnant_fp8x8(plan, buf_idx, remnant_row_slot, dim_base, valid);
+                            bf16 scale = remnant_scale(plan, buf_idx, remnant_row_slot, 7, valid);
                             bf16x8 cur = cvt_fp8x8_bf16x8(first, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
                             float values[8] = {
                                 (float)cur.a01.x, (float)cur.a01.y,
