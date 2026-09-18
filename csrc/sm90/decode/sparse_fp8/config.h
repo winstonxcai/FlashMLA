@@ -108,6 +108,7 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][REMNANT_ROWS * 256];
     CUTE_ALIGNAS(8) uint64_t remnant_bitmaps[NUM_K_BUFS][REMNANT_ROWS * 8];
     uint16_t remnant_rank_prefix[NUM_K_BUFS][REMNANT_ROWS * 9];
+    uint8_t remnant_ranks[NUM_K_BUFS][REMNANT_ROWS * 512];
     uint8_t remnant_scales[NUM_K_BUFS][REMNANT_ROWS * 8];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
 };

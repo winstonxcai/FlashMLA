@@ -56,6 +56,7 @@ __device__ __forceinline__ void prepare_remnant_row(
     if (value_group == 0) {
         uint64_t *bitmap = plan.remnant_bitmaps[buf_idx] + row_slot * 8;
         uint16_t *prefix = plan.remnant_rank_prefix[buf_idx] + row_slot * 9;
+        uint8_t *ranks = plan.remnant_ranks[buf_idx] + row_slot * 512;
         uint8_t *scales = plan.remnant_scales[buf_idx] + row_slot * 8;
         const uint64_t *gbitmap = params.remnant_bitmaps
             + block_index * params.stride_remnant_bitmaps_page
@@ -69,6 +70,11 @@ __device__ __forceinline__ void prepare_remnant_row(
             bitmap[word] = bits;
             scales[word] = valid ? __ldg(gscales + word) : 0;
             prefix[word + 1] = prefix[word] + __popcll(bits);
+            int rank = prefix[word];
+            for (int lane = 0; lane < 64; ++lane) {
+                ranks[word * 64 + lane] = static_cast<uint8_t>(rank);
+                rank += static_cast<int>((bits >> (63 - lane)) & 1ULL);
+            }
         }
     }
     __syncwarp();
@@ -86,17 +92,15 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     uint32_t lo = 0;
     uint32_t hi = 0;
     const uint64_t *bitmap = plan.remnant_bitmaps[buf_idx] + row_slot * 8;
-    const uint16_t *prefix = plan.remnant_rank_prefix[buf_idx] + row_slot * 9;
+    const uint8_t *ranks = plan.remnant_ranks[buf_idx] + row_slot * 512;
     const uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 256;
     const int word = dim_base / 64;
     const uint64_t keep = valid ? bitmap[word] : 0;
-    const int rank_base = prefix[word];
     for (int i = 0; i < 8; ++i) {
         const int bit = dim_base + i;
         const int lane = bit & 63;
-        const uint64_t prior_mask = lane == 0 ? 0ULL : (~0ULL << (64 - lane));
         const bool kept = ((keep >> (63 - lane)) & 1ULL) != 0;
-        const int rank = rank_base + __popcll(keep & prior_mask);
+        const int rank = ranks[bit];
         const uint8_t code = valid && kept ? values[rank] : 0;
         if (i < 4)
             reinterpret_cast<uint8_t*>(&lo)[i] = code;
