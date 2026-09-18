@@ -24,9 +24,10 @@ using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using fp8_e8m0 = __nv_fp8_e8m0;
 
+template <typename Plan>
 __device__ __forceinline__ void prepare_remnant_row(
     const SparseAttnDecodeParams &params,
-    SharedMemoryPlan &plan,
+    Plan &plan,
     int buf_idx,
     int row_slot,
     int block_index,
@@ -73,8 +74,9 @@ __device__ __forceinline__ void prepare_remnant_row(
     __syncwarp();
 }
 
+template <typename Plan>
 __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
-    const SharedMemoryPlan &plan,
+    const Plan &plan,
     int buf_idx,
     int row_slot,
     int dim_base,
@@ -106,8 +108,9 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     return result;
 }
 
+template <typename Plan>
 __device__ __forceinline__ bf16 remnant_scale(
-    const SharedMemoryPlan &plan,
+    const Plan &plan,
     int buf_idx,
     int row_slot,
     int word,
