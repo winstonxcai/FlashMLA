@@ -129,15 +129,11 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     const int rank_base = prefix[word] + __popcll(keep & prior_mask);
     const uint32_t rank_pack = remnant_byte_rank_pack(byte_mask);
     const int aligned_base = rank_base & ~15;
-    const uint2 survivor_lo = valid
-        ? *reinterpret_cast<const uint2 *>(values + aligned_base)
-        : uint2{0, 0};
-    const uint2 survivor_hi = valid
-        ? *reinterpret_cast<const uint2 *>(values + aligned_base + 8)
-        : uint2{0, 0};
     const uint32_t survivor_words[4] = {
-        survivor_lo.x, survivor_lo.y,
-        survivor_hi.x, survivor_hi.y,
+        valid ? *reinterpret_cast<const uint32_t *>(values + aligned_base) : 0,
+        valid ? *reinterpret_cast<const uint32_t *>(values + aligned_base + 4) : 0,
+        valid ? *reinterpret_cast<const uint32_t *>(values + aligned_base + 8) : 0,
+        valid ? *reinterpret_cast<const uint32_t *>(values + aligned_base + 12) : 0,
     };
     for (int i = 0; i < 8; ++i) {
         const int bit = dim_base + i;
