@@ -79,6 +79,7 @@ def _p95(values: list[float]) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--heads", default="64,128")
     parser.add_argument("--batches", default="8,16")
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
@@ -93,7 +94,7 @@ def main() -> None:
     torch.manual_seed(20260919)
     print("heads,batch,topk,native_decode_ms,direct_decode_ms,adapter_total_ms,median_regression_pct,p95_regression_pct,status")
     misses = []
-    for heads in (64, 128):
+    for heads in (int(value) for value in args.heads.split(",")):
         for batch in (int(value) for value in args.batches.split(",")):
             case = make_case(heads, 512, batch=batch, unique_selections=True)
             native_meta = flash_mla.get_mla_metadata()[0]
