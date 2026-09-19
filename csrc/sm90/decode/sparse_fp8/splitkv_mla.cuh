@@ -51,7 +51,7 @@ __device__ __forceinline__ void prepare_remnant_row(
     int lane_idx
 ) {
     const int value_group = lane_idx >> 3;
-    uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 256;
+    uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 272;
 
     // Four threads associated with one token each load a contiguous 64-byte
     // survivor range. The packed record is therefore read once with 128-bit
@@ -85,6 +85,7 @@ __device__ __forceinline__ void prepare_remnant_row(
             scales[word] = valid ? __ldg(gscales + word) : 0;
             prefix[word + 1] = prefix[word] + __popcll(bits);
         }
+        *reinterpret_cast<uint4 *>(values + 256) = uint4{0, 0, 0, 0};
     }
     __syncwarp();
 }
@@ -102,7 +103,7 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     uint32_t hi = 0;
     const uint64_t *bitmap = plan.remnant_bitmaps[buf_idx] + row_slot * 8;
     const uint16_t *prefix = plan.remnant_rank_prefix[buf_idx] + row_slot * 9;
-    const uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 256;
+    const uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 272;
     const int word = dim_base / 64;
     const uint64_t keep = valid ? bitmap[word] : 0;
     const int byte_in_word = (dim_base & 63) >> 3;
@@ -114,13 +115,19 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
         : (~0ULL << (64 - byte_in_word * 8));
     const int rank_base = prefix[word] + __popcll(keep & prior_mask);
     const uint32_t rank_pack = remnant_byte_rank_pack(byte_mask);
+    const uint64_t survivor_window = valid
+        ? *reinterpret_cast<const uint64_t *>(values + rank_base)
+        : 0ULL;
     for (int i = 0; i < 8; ++i) {
         const int bit = dim_base + i;
         const int lane = bit & 63;
         const bool kept = ((keep >> (63 - lane)) & 1ULL) != 0;
         const int rank_shift = i < 4 ? 16 + 4 * i : 4 * (i - 4);
         const int rank = rank_base + ((rank_pack >> rank_shift) & 0xf);
-        const uint8_t code = valid && kept ? values[rank] : 0;
+        const int local_rank = rank - rank_base;
+        const uint8_t code = valid && kept
+            ? static_cast<uint8_t>(survivor_window >> (8 * local_rank))
+            : 0;
         if (i < 4)
             reinterpret_cast<uint8_t*>(&lo)[i] = code;
         else

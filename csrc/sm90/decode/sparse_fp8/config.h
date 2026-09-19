@@ -105,7 +105,9 @@ struct SharedMemoryPlan {
     // bitmap loads and prior-word popcounts during reconstruction.
     // H64 processes two 32-token rounds in one CTA and H128 uses one 32-token
     // half per clustered CTA. The scratch rows are reused between rounds.
-    CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][REMNANT_ROWS * 256];
+    // Sixteen bytes of internal padding let the last survivor window be read
+    // as one contiguous 64-bit value without changing the 328-byte record.
+    CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][REMNANT_ROWS * 272];
     CUTE_ALIGNAS(8) uint64_t remnant_bitmaps[NUM_K_BUFS][REMNANT_ROWS * 8];
     uint16_t remnant_rank_prefix[NUM_K_BUFS][REMNANT_ROWS * 9];
     uint8_t remnant_scales[NUM_K_BUFS][REMNANT_ROWS * 8];
