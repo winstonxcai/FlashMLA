@@ -61,7 +61,20 @@ __device__ __forceinline__ void prepare_remnant_row(
             + block_index * params.stride_remnant_values_page
             + row_index * params.stride_remnant_values_row;
         for (int offset = 0; offset < 64; offset += 16) {
-            uint4 chunk = __ldg(reinterpret_cast<const uint4 *>(gvalues + value_group * 64 + offset));
+            const uint8_t *src = gvalues + value_group * 64 + offset;
+            uint4 chunk;
+            // The external record is 328 B, so successive rows alternate
+            // between 16-byte alignment and an 8-byte offset.  Keep the
+            // coalesced 128-bit path for aligned rows and use two aligned
+            // 64-bit transactions for the other half rather than issuing a
+            // misaligned uint4 load.
+            if ((reinterpret_cast<uintptr_t>(src) & 0xf) == 0) {
+                chunk = __ldg(reinterpret_cast<const uint4 *>(src));
+            } else {
+                const uint2 lo = __ldg(reinterpret_cast<const uint2 *>(src));
+                const uint2 hi = __ldg(reinterpret_cast<const uint2 *>(src + 8));
+                chunk = uint4{lo.x, lo.y, hi.x, hi.y};
+            }
             *reinterpret_cast<uint4 *>(values + value_group * 64 + offset) = chunk;
         }
     }
