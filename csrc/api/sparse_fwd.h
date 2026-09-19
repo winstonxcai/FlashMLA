@@ -244,11 +244,14 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         } else {
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
-    }
-#endif
-    else {
+    } else {
         TORCH_CHECK(false, "Unsupported architecture");
     }
+#else
+    } else {
+        TORCH_CHECK(false, "Unsupported architecture");
+    }
+#endif
 
     return {out, max_logits, lse};
 }
