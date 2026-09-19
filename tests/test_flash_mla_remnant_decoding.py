@@ -10,7 +10,7 @@ try:
 except ImportError:
     flash_mla = None
 
-from remnant_fixture import make_case
+from remnant_fixture import make_case, materialize_native
 
 
 pytestmark = pytest.mark.skipif(
@@ -73,6 +73,22 @@ def test_direct_decode_matches_native_adapter(num_heads: int, batch: int, topk_l
 
 
 @pytest.mark.parametrize("num_heads", [64, 128])
+def test_direct_decode_mixed_lengths_and_poisoned_padding(num_heads: int):
+    case = make_case(num_heads, 512, batch=8)
+    lengths = torch.tensor([0, 1, 63, 64, 65, 317, 511, 512], device="cuda", dtype=torch.int32)
+    case.extra_length.copy_(lengths)
+    # Native was materialized before poisoning. Both paths must ignore every
+    # selection at or beyond the per-request length.
+    for request, length in enumerate(lengths.tolist()):
+        case.packed_indices[request, :, length:] = torch.iinfo(torch.int32).max
+        case.raw_indices[request, :, length:] = -1
+    native_out, native_lse = _run_native(case)
+    direct_out, direct_lse = _run_remnant(case)
+    torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
+    torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
 @pytest.mark.parametrize("batch", [8, 16])
 def test_direct_decode_cuda_graph_replay(num_heads: int, batch: int):
     case = make_case(num_heads, 512, batch=batch)
@@ -106,6 +122,11 @@ def test_direct_decode_cuda_graph_replay(num_heads: int, batch: int):
     # Inputs must remain live after capture.  This catches a graph that only
     # proves replay of an unchanged buffer rather than replay correctness.
     case.q.normal_()
+    case.packed_buffers[2].add_(1)
+    case.packed_indices.copy_(case.packed_indices.roll(1, dims=-1))
+    case.raw_indices.copy_(case.raw_indices.roll(1, dims=-1))
+    case.extra_length.sub_(13)
+    materialize_native(case)
     graph.replay()
     torch.cuda.synchronize()
     second = tuple(value.clone() for value in captured)

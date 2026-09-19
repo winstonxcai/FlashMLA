@@ -104,6 +104,7 @@ def _native_from_packed(
     freqs: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     values, _, scales = buffers
+    batch, _, selected_k = physical.shape
     rows = raw.numel()
     pages = (rows + PAGE_SIZE - 1) // PAGE_SIZE
     bytes_per_page = ((PAGE_SIZE * 584 + 575) // 576) * 576
@@ -135,9 +136,10 @@ def _native_from_packed(
         (pages, PAGE_SIZE, 1, 584),
         (bytes_per_page, 584, 584, 1),
     )
-    return native_cache, torch.arange(
+    native_indices = torch.arange(
         rows, dtype=torch.int32, device=raw.device
-    ).view(1, 1, rows), storage
+    ).view(batch, 1, selected_k)
+    return native_cache, native_indices, storage
 
 
 def materialize_native(case: RemnantCase) -> None:
@@ -187,18 +189,24 @@ def make_case(
     topk_length: int,
     batch: int = 1,
     device: torch.device | str = "cuda",
+    unique_selections: bool = False,
 ) -> RemnantCase:
     device = torch.device(device)
-    rows = max(PAGE_SIZE, batch * PAGE_SIZE)
+    rows_per_request = 512 if unique_selections else PAGE_SIZE
+    rows = max(PAGE_SIZE, batch * rows_per_request)
     latent = torch.randn((rows, HEAD_DIM), device=device)
     packed, mask = _pack(latent)
     packed_indices = torch.stack([
-        (batch_index * PAGE_SIZE + torch.arange(512, device=device, dtype=torch.int32) % PAGE_SIZE)
+        batch_index * rows_per_request
+        + torch.arange(512, device=device, dtype=torch.int32) % rows_per_request
         for batch_index in range(batch)
     ]).view(batch, 1, 512)
-    raw_indices = packed_indices + 3 + (
-        torch.arange(512, device=device, dtype=torch.int32).view(1, 1, 512) % 11
-    )
+    if unique_selections:
+        raw_indices = packed_indices * 3 + 17
+    else:
+        raw_indices = packed_indices + 3 + (
+            torch.arange(512, device=device, dtype=torch.int32).view(1, 1, 512) % 11
+        )
     if topk_length < 512:
         packed_indices = packed_indices.clone()
         raw_indices = raw_indices.clone()
@@ -207,10 +215,26 @@ def make_case(
     extra_length = torch.full((batch,), topk_length, dtype=torch.int32, device=device)
     freqs = _make_freqs(max(128, int(raw_indices.max().item()) + 2), device)
     native_cache, native_indices, native_storage = _native_from_packed(
-        packed, mask, packed_indices.reshape(-1), raw_indices.reshape(-1), freqs
+        packed, mask, packed_indices, raw_indices, freqs
     )
     q = torch.randn((batch, 1, num_heads, HEAD_DIM), device=device, dtype=torch.bfloat16)
-    swa_cache = torch.zeros((batch, PAGE_SIZE, 1, 576), dtype=torch.uint8, device=device)
+    swa_storage = torch.zeros(
+        (batch, PAGE_SIZE * 584), dtype=torch.uint8, device=device
+    )
+    swa_cache = swa_storage.as_strided(
+        (batch, PAGE_SIZE, 1, 584), (PAGE_SIZE * 584, 584, 584, 1)
+    )
+    swa_flat = swa_cache.reshape(batch * PAGE_SIZE, 584)
+    swa_flat[:, :448].copy_(
+        (torch.arange(batch * PAGE_SIZE * 448, device=device) % 113 + 1)
+        .to(torch.uint8)
+        .view(batch * PAGE_SIZE, 448)
+    )
+    swa_tail = torch.linspace(-0.25, 0.25, batch * PAGE_SIZE * 64, device=device)
+    swa_flat[:, 448:576].copy_(
+        swa_tail.to(torch.bfloat16).view(torch.uint8).reshape(batch * PAGE_SIZE, 128)
+    )
+    swa_flat[:, 576:584].fill_(127)
     swa_indices = torch.arange(PAGE_SIZE, device=device, dtype=torch.int32).view(1, 1, PAGE_SIZE)
     swa_indices = (swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1, 1) * PAGE_SIZE).contiguous()
     swa_length = torch.full((batch,), PAGE_SIZE, dtype=torch.int32, device=device)
@@ -221,12 +245,12 @@ def make_case(
         swa_indices=swa_indices,
         swa_length=swa_length,
         packed_buffers=packed,
-        packed_indices=packed_indices.expand(batch, -1, -1).contiguous(),
-        raw_indices=raw_indices.expand(batch, -1, -1).contiguous(),
+        packed_indices=packed_indices.contiguous(),
+        raw_indices=raw_indices.contiguous(),
         extra_length=extra_length,
         freqs=freqs,
         native_cache=native_cache,
-        native_indices=native_indices.view(1, 1, -1).expand(batch, -1, -1).contiguous(),
+        native_indices=native_indices.contiguous(),
         native_storage=native_storage,
         mask=mask,
         sink=sink,

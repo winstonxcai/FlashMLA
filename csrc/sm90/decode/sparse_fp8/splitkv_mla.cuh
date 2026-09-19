@@ -39,6 +39,28 @@ __device__ __forceinline__ uint32_t remnant_byte_rank_pack(uint8_t bits) {
     return (high << 16) | (low + __popc(bits >> 4) * 0x1111u);
 }
 
+// Keep the survivor window in named registers.  Indexing a byte through an
+// address-taken uint4 array makes nvcc materialize that array in thread-local
+// memory, adding an LDL/STL pair for every reconstructed fragment.
+__device__ __forceinline__ uint8_t remnant_register_byte(
+    const uint4 &first,
+    const uint4 &second,
+    int byte_index
+) {
+    uint32_t word;
+    switch (byte_index >> 2) {
+        case 0: word = first.x; break;
+        case 1: word = first.y; break;
+        case 2: word = first.z; break;
+        case 3: word = first.w; break;
+        case 4: word = second.x; break;
+        case 5: word = second.y; break;
+        case 6: word = second.z; break;
+        default: word = second.w; break;
+    }
+    return static_cast<uint8_t>(word >> ((byte_index & 3) * 8));
+}
+
 template <typename Plan>
 __device__ __forceinline__ void prepare_remnant_row(
     const SparseAttnDecodeParams &params,
@@ -133,12 +155,13 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     // not sufficient.  The staged row has 16 bytes of zero padding, making
     // this bounded 32-byte read safe even for the final fragment.
     const int aligned_base = rank_base & ~15;
-    uint4 survivor_window[2] = {};
+    uint4 survivor_window_first = {};
+    uint4 survivor_window_second = {};
     if (valid) {
-        survivor_window[0] = *reinterpret_cast<const uint4 *>(values + aligned_base);
-        survivor_window[1] = *reinterpret_cast<const uint4 *>(values + aligned_base + 16);
+        survivor_window_first = *reinterpret_cast<const uint4 *>(values + aligned_base);
+        survivor_window_second = *reinterpret_cast<const uint4 *>(values + aligned_base + 16);
     }
-    const uint8_t *window_bytes = reinterpret_cast<const uint8_t *>(survivor_window);
+    CUTE_UNROLL
     for (int i = 0; i < 8; ++i) {
         const int bit = dim_base + i;
         const int lane = bit & 63;
@@ -146,7 +169,11 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
         const int rank_shift = i < 4 ? 16 + 4 * i : 4 * (i - 4);
         const int rank = rank_base + ((rank_pack >> rank_shift) & 0xf);
         const int local_rank = rank - aligned_base;
-        const uint8_t code = valid && kept ? window_bytes[local_rank] : 0;
+        const uint8_t code = valid && kept
+            ? remnant_register_byte(
+                  survivor_window_first, survivor_window_second, local_rank
+              )
+            : 0;
         if (i < 4)
             reinterpret_cast<uint8_t*>(&lo)[i] = code;
         else

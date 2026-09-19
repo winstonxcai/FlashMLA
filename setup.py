@@ -20,6 +20,8 @@ def get_features_args():
     features_args = []
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if not is_flag_set("FLASH_MLA_DISABLE_SM100"):
+        features_args.append("-DFLASHMLA_ENABLE_SM100")
     return features_args
 
 def get_arch_flags():
