@@ -27,6 +27,8 @@ class RemnantCase:
     freqs: torch.Tensor
     native_cache: torch.Tensor
     native_indices: torch.Tensor
+    native_storage: torch.Tensor
+    mask: torch.Tensor
     sink: torch.Tensor
     sm_scale: float
 
@@ -87,8 +89,8 @@ def _rotate_tail(tail: torch.Tensor, raw: torch.Tensor, freqs: torch.Tensor) -> 
         index = raw.to(torch.long) * 128 + pair
         c = flat_freqs.index_select(0, index.reshape(-1))[:, 0].reshape(raw.shape)
         s = flat_freqs.index_select(0, index.reshape(-1))[:, 1].reshape(raw.shape)
-        x0 = result[..., 2 * pair]
-        x1 = result[..., 2 * pair + 1]
+        x0 = result[..., 2 * pair].clone()
+        x1 = result[..., 2 * pair + 1].clone()
         result[..., 2 * pair] = x0 * c - x1 * s
         result[..., 2 * pair + 1] = x0 * s + x1 * c
     return result.to(torch.bfloat16)
@@ -100,8 +102,8 @@ def _native_from_packed(
     physical: torch.Tensor,
     raw: torch.Tensor,
     freqs: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    values, bitmaps, scales = buffers
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    values, _, scales = buffers
     rows = raw.numel()
     pages = (rows + PAGE_SIZE - 1) // PAGE_SIZE
     bytes_per_page = ((PAGE_SIZE * 584 + 575) // 576) * 576
@@ -125,13 +127,59 @@ def _native_from_packed(
         kept = flat_mask[source, :NOPE_DIM]
         codes[kept] = flat_values[source].index_select(0, ranks[source, :NOPE_DIM][kept])
         storage[page, data_base : data_base + NOPE_DIM] = codes
-        storage[page, scale_base : scale_base + 7] = flat_scales[source, :7]
+        storage[page, scale_base : scale_base + 8] = flat_scales[source, :8]
         storage[page, data_base + NOPE_DIM : data_base + 576] = (
             rotated_tail.contiguous().view(torch.uint8)
         )
-    return storage[:, : PAGE_SIZE * 576].view(pages, PAGE_SIZE, 1, 576), torch.arange(
+    native_cache = storage.as_strided(
+        (pages, PAGE_SIZE, 1, 584),
+        (bytes_per_page, 584, 584, 1),
+    )
+    return native_cache, torch.arange(
         rows, dtype=torch.int32, device=raw.device
-    ).view(1, 1, rows)
+    ).view(1, 1, rows), storage
+
+
+def materialize_native(case: RemnantCase) -> None:
+    """Reconstruct the selected Packed rows into the reusable Native workspace."""
+    values, _, scales = case.packed_buffers
+    source = case.packed_indices.reshape(-1)
+    raw = case.raw_indices.reshape(-1)
+    lengths = case.extra_length.repeat_interleave(case.packed_indices.shape[-1])
+    valid = torch.arange(source.numel(), device=source.device) % case.packed_indices.shape[-1] < lengths
+    flat_values = values.reshape(-1, KEEP_K)
+    flat_scales = scales.reshape(-1, 8)
+    flat_mask = case.mask.reshape(-1, HEAD_DIM)
+    ranks = flat_mask.to(torch.int32).cumsum(-1) - 1
+    selected_values = flat_values.index_select(0, source)
+    selected_mask = flat_mask.index_select(0, source)
+    selected_ranks = ranks.index_select(0, source).clamp_min(0)
+    codes = torch.gather(selected_values, 1, selected_ranks)
+    codes = torch.where(selected_mask, codes, torch.zeros_like(codes))
+
+    decoded = _decode_packed(case.packed_buffers, case.mask)
+    tail = decoded.index_select(0, source)[:, NOPE_DIM:].float().reshape(-1, 32, 2)
+    freq_rows = case.freqs.reshape(-1, 2).index_select(
+        0, (raw.clamp_min(0).to(torch.long)[:, None] * 128 + torch.arange(32, device=raw.device)[None, :]).reshape(-1)
+    ).reshape(-1, 32, 2)
+    x0 = tail[..., 0].clone()
+    x1 = tail[..., 1].clone()
+    rotated = torch.stack((x0 * freq_rows[..., 0] - x1 * freq_rows[..., 1],
+                           x0 * freq_rows[..., 1] + x1 * freq_rows[..., 0]), dim=-1)
+    tail_bytes = rotated.reshape(-1, ROPE_DIM).to(torch.bfloat16).view(torch.uint8)
+    codes = torch.cat((codes[:, :NOPE_DIM], tail_bytes), dim=1)
+    codes = torch.where(valid[:, None], codes, torch.zeros_like(codes))
+    selected_scales = flat_scales.index_select(0, source)
+    selected_scales = torch.where(valid[:, None], selected_scales, torch.zeros_like(selected_scales))
+
+    case.native_storage.zero_()
+    for page in range(case.native_storage.shape[0]):
+        begin = page * PAGE_SIZE
+        end = begin + PAGE_SIZE
+        page_codes = codes[begin:end]
+        page_scales = selected_scales[begin:end]
+        case.native_storage[page, : PAGE_SIZE * 576].view(PAGE_SIZE, 576).copy_(page_codes)
+        case.native_storage[page, PAGE_SIZE * 576 : PAGE_SIZE * 576 + PAGE_SIZE * 8].copy_(page_scales.reshape(-1))
 
 
 def make_case(
@@ -141,23 +189,28 @@ def make_case(
     device: torch.device | str = "cuda",
 ) -> RemnantCase:
     device = torch.device(device)
-    rows = PAGE_SIZE
+    rows = max(PAGE_SIZE, batch * PAGE_SIZE)
     latent = torch.randn((rows, HEAD_DIM), device=device)
     packed, mask = _pack(latent)
-    packed_indices = torch.arange(512, device=device, dtype=torch.int32).view(1, 1, 512) % rows
+    packed_indices = torch.stack([
+        (batch_index * PAGE_SIZE + torch.arange(512, device=device, dtype=torch.int32) % PAGE_SIZE)
+        for batch_index in range(batch)
+    ]).view(batch, 1, 512)
     raw_indices = packed_indices + 3
     if topk_length < 512:
+        packed_indices = packed_indices.clone()
+        raw_indices = raw_indices.clone()
         packed_indices[:, :, topk_length:] = 0
         raw_indices[:, :, topk_length:] = -1
     extra_length = torch.full((batch,), topk_length, dtype=torch.int32, device=device)
-    freqs = _make_freqs(128, device)
-    native_cache, native_indices = _native_from_packed(
+    freqs = _make_freqs(max(128, int(raw_indices.max().item()) + 2), device)
+    native_cache, native_indices, native_storage = _native_from_packed(
         packed, mask, packed_indices.reshape(-1), raw_indices.reshape(-1), freqs
     )
     q = torch.randn((batch, 1, num_heads, HEAD_DIM), device=device, dtype=torch.bfloat16)
-    swa_cache = torch.zeros((1, PAGE_SIZE, 1, 576), dtype=torch.uint8, device=device)
+    swa_cache = torch.zeros((batch, PAGE_SIZE, 1, 576), dtype=torch.uint8, device=device)
     swa_indices = torch.arange(PAGE_SIZE, device=device, dtype=torch.int32).view(1, 1, PAGE_SIZE)
-    swa_indices = swa_indices.expand(batch, -1, -1).contiguous()
+    swa_indices = (swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1, 1) * PAGE_SIZE).contiguous()
     swa_length = torch.full((batch,), PAGE_SIZE, dtype=torch.int32, device=device)
     sink = torch.linspace(-0.1, 0.1, num_heads, device=device)
     return RemnantCase(
@@ -171,7 +224,9 @@ def make_case(
         extra_length=extra_length,
         freqs=freqs,
         native_cache=native_cache,
-        native_indices=native_indices.expand(batch, -1, -1).contiguous(),
+        native_indices=native_indices.view(1, 1, -1).expand(batch, -1, -1).contiguous(),
+        native_storage=native_storage,
+        mask=mask,
         sink=sink,
         sm_scale=HEAD_DIM ** -0.5,
     )

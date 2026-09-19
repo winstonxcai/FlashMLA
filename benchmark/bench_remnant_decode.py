@@ -11,11 +11,10 @@ import torch
 import flash_mla
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-from remnant_fixture import make_case  # noqa: E402
+from remnant_fixture import make_case, materialize_native  # noqa: E402
 
 
-def _native(case):
-    meta = flash_mla.get_mla_metadata()[0]
+def _native(case, meta):
     return flash_mla.flash_mla_with_kvcache(
         case.q, case.swa_cache, None, None, 512, meta, None,
         case.sm_scale, False, True, case.swa_indices, case.sink,
@@ -23,8 +22,12 @@ def _native(case):
     )
 
 
-def _direct(case):
-    meta = flash_mla.get_mla_metadata()[0]
+def _adapter(case, meta):
+    materialize_native(case)
+    return _native(case, meta)
+
+
+def _direct(case, meta):
     return flash_mla.flash_mla_with_remnant_kvcache(
         case.q, case.swa_cache, case.swa_indices, case.packed_buffers,
         case.raw_indices, case.freqs, meta, topk_length=case.swa_length,
@@ -61,7 +64,7 @@ def _kernel_time(fn) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batches", default="1,2,8")
+    parser.add_argument("--batches", default="8,16")
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     args = parser.parse_args()
@@ -71,20 +74,22 @@ def main() -> None:
         raise RuntimeError("Direct Remnant decode currently targets SM90")
 
     print("heads,batch,topk,native_total_ms,adapter_total_ms,direct_total_ms,"
-          "native_kernel_ms,direct_kernel_ms,direct_vs_native_pct")
+          "native_kernel_ms,adapter_kernel_ms,direct_kernel_ms,direct_vs_native_pct")
     for heads in (64, 128):
         for batch in (int(value) for value in args.batches.split(",")):
             case = make_case(heads, 512, batch=batch)
-            native_total = _measure(lambda: _native(case), args.warmup, args.repeats)
-            adapter_total = _measure(lambda: _native(case), args.warmup, args.repeats)
-            direct_total = _measure(lambda: _direct(case), args.warmup, args.repeats)
-            native_kernel = _kernel_time(lambda: _native(case))
-            direct_kernel = _kernel_time(lambda: _direct(case))
+            meta = flash_mla.get_mla_metadata()[0]
+            native_total = _measure(lambda: _native(case, meta), args.warmup, args.repeats)
+            adapter_total = _measure(lambda: _adapter(case, meta), args.warmup, args.repeats)
+            direct_total = _measure(lambda: _direct(case, meta), args.warmup, args.repeats)
+            native_kernel = _kernel_time(lambda: _native(case, meta))
+            adapter_kernel = _kernel_time(lambda: _adapter(case, meta))
+            direct_kernel = _kernel_time(lambda: _direct(case, meta))
             delta = 100.0 * (direct_total / native_total - 1.0)
             print(
-                f"{heads},{batch},{case.extra_length.item()},"
+                f"{heads},{batch},512,"
                 f"{native_total:.4f},{adapter_total:.4f},{direct_total:.4f},"
-                f"{native_kernel:.4f},{direct_kernel:.4f},{delta:.3f}"
+                f"{native_kernel:.4f},{adapter_kernel:.4f},{direct_kernel:.4f},{delta:.3f}"
             )
 
 

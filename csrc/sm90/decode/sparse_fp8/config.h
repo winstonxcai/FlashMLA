@@ -12,6 +12,17 @@ using namespace cute;
 
 namespace sm90::decode::sparse_fp8 {
 
+template <bool ENABLED, int NUM_K_BUFS, int ROWS>
+struct RemnantScratchStorage {};
+
+template <int NUM_K_BUFS, int ROWS>
+struct RemnantScratchStorage<true, NUM_K_BUFS, ROWS> {
+    CUTE_ALIGNAS(16) uint8_t values[NUM_K_BUFS][ROWS * 272];
+    CUTE_ALIGNAS(8) uint64_t bitmaps[NUM_K_BUFS][ROWS * 8];
+    uint16_t rank_prefix[NUM_K_BUFS][ROWS * 9];
+    uint8_t scales[NUM_K_BUFS][ROWS * 8];
+};
+
 template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false>
 class KernelTemplate {
 public:
@@ -100,17 +111,9 @@ struct SharedMemoryPlan {
     bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
-    // Stage each packed row once. Four producer threads cooperatively load
-    // the contiguous survivor bytes; the prefix table avoids repeated global
-    // bitmap loads and prior-word popcounts during reconstruction.
-    // H64 processes two 32-token rounds in one CTA and H128 uses one 32-token
-    // half per clustered CTA. The scratch rows are reused between rounds.
-    // Sixteen bytes of internal padding let the last survivor window be read
-    // as one contiguous 64-bit value without changing the 328-byte record.
-    CUTE_ALIGNAS(16) uint8_t remnant_values[NUM_K_BUFS][REMNANT_ROWS * 272];
-    CUTE_ALIGNAS(8) uint64_t remnant_bitmaps[NUM_K_BUFS][REMNANT_ROWS * 8];
-    uint16_t remnant_rank_prefix[NUM_K_BUFS][REMNANT_ROWS * 9];
-    uint8_t remnant_scales[NUM_K_BUFS][REMNANT_ROWS * 8];
+    // This storage is present only in Remnant instantiations. Native keeps
+    // the stock shared-memory footprint and occupancy constraints.
+    RemnantScratchStorage<REMNANT, NUM_K_BUFS, REMNANT_ROWS> remnant;
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
 };
 

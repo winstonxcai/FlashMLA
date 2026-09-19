@@ -62,17 +62,20 @@ def _run_remnant(case):
 
 
 @pytest.mark.parametrize("num_heads", [64, 128])
+@pytest.mark.parametrize("batch", [8, 16])
 @pytest.mark.parametrize("topk_length", [512, 317])
-def test_direct_decode_matches_native_adapter(num_heads: int, topk_length: int):
-    case = make_case(num_heads, topk_length)
+def test_direct_decode_matches_native_adapter(num_heads: int, batch: int, topk_length: int):
+    case = make_case(num_heads, topk_length, batch=batch)
     native_out, native_lse = _run_native(case)
     direct_out, direct_lse = _run_remnant(case)
     torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
     torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
 
 
-def test_direct_decode_cuda_graph_replay():
-    case = make_case(64, 512)
+@pytest.mark.parametrize("num_heads", [64, 128])
+@pytest.mark.parametrize("batch", [8, 16])
+def test_direct_decode_cuda_graph_replay(num_heads: int, batch: int):
+    case = make_case(num_heads, 512, batch=batch)
     meta = flash_mla.get_mla_metadata()[0]
     for _ in range(3):
         _run_remnant(case)
@@ -96,8 +99,17 @@ def test_direct_decode_cuda_graph_replay():
     graph.replay()
     torch.cuda.synchronize()
     first = tuple(value.clone() for value in captured)
+    native_first = _run_native(case)
+    torch.testing.assert_close(first[0], native_first[0], atol=2.0e-2, rtol=2.0e-2)
+    torch.testing.assert_close(first[1], native_first[1], atol=2.0e-2, rtol=2.0e-2)
+
+    # Inputs must remain live after capture.  This catches a graph that only
+    # proves replay of an unchanged buffer rather than replay correctness.
+    case.q.normal_()
     graph.replay()
     torch.cuda.synchronize()
     second = tuple(value.clone() for value in captured)
-    torch.testing.assert_close(first[0], second[0], atol=0, rtol=0)
-    torch.testing.assert_close(first[1], second[1], atol=0, rtol=0)
+    native_second = _run_native(case)
+    torch.testing.assert_close(second[0], native_second[0], atol=2.0e-2, rtol=2.0e-2)
+    torch.testing.assert_close(second[1], native_second[1], atol=2.0e-2, rtol=2.0e-2)
+    assert not torch.equal(first[0], second[0])

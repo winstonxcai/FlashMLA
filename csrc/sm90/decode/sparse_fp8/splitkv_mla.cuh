@@ -51,7 +51,7 @@ __device__ __forceinline__ void prepare_remnant_row(
     int lane_idx
 ) {
     const int value_group = lane_idx >> 3;
-    uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 272;
+    uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
 
     // Four threads associated with one token each load a contiguous 64-byte
     // survivor range. The packed record is therefore read once with 128-bit
@@ -82,9 +82,9 @@ __device__ __forceinline__ void prepare_remnant_row(
     // One thread per token loads the bitmap and scale metadata and computes
     // the word prefix counts shared by the four survivor-loading threads.
     if (value_group == 0) {
-        uint64_t *bitmap = plan.remnant_bitmaps[buf_idx] + row_slot * 8;
-        uint16_t *prefix = plan.remnant_rank_prefix[buf_idx] + row_slot * 9;
-        uint8_t *scales = plan.remnant_scales[buf_idx] + row_slot * 8;
+        uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
+        uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
+        uint8_t *scales = plan.remnant.scales[buf_idx] + row_slot * 8;
         const uint64_t *gbitmap = params.remnant_bitmaps
             + block_index * params.stride_remnant_bitmaps_page
             + row_index * params.stride_remnant_bitmaps_row;
@@ -114,9 +114,9 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     fp8x8 result;
     uint32_t lo = 0;
     uint32_t hi = 0;
-    const uint64_t *bitmap = plan.remnant_bitmaps[buf_idx] + row_slot * 8;
-    const uint16_t *prefix = plan.remnant_rank_prefix[buf_idx] + row_slot * 9;
-    const uint8_t *values = plan.remnant_values[buf_idx] + row_slot * 272;
+    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
+    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
+    const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
     const int word = dim_base / 64;
     const uint64_t keep = valid ? bitmap[word] : 0;
     const int byte_in_word = (dim_base & 63) >> 3;
@@ -128,15 +128,25 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
         : (~0ULL << (64 - byte_in_word * 8));
     const int rank_base = prefix[word] + __popcll(keep & prior_mask);
     const uint32_t rank_pack = remnant_byte_rank_pack(byte_mask);
+    // A fragment can begin at any survivor rank modulo 16.  Eight logical
+    // coordinates can therefore span 24 bytes, so a single 16-byte window is
+    // not sufficient.  The staged row has 16 bytes of zero padding, making
+    // this bounded 32-byte read safe even for the final fragment.
+    const int aligned_base = rank_base & ~15;
+    uint4 survivor_window[2] = {};
+    if (valid) {
+        survivor_window[0] = *reinterpret_cast<const uint4 *>(values + aligned_base);
+        survivor_window[1] = *reinterpret_cast<const uint4 *>(values + aligned_base + 16);
+    }
+    const uint8_t *window_bytes = reinterpret_cast<const uint8_t *>(survivor_window);
     for (int i = 0; i < 8; ++i) {
         const int bit = dim_base + i;
         const int lane = bit & 63;
         const bool kept = ((keep >> (63 - lane)) & 1ULL) != 0;
         const int rank_shift = i < 4 ? 16 + 4 * i : 4 * (i - 4);
         const int rank = rank_base + ((rank_pack >> rank_shift) & 0xf);
-        const uint8_t code = valid && kept
-            ? values[rank]
-            : 0;
+        const int local_rank = rank - aligned_base;
+        const uint8_t code = valid && kept ? window_bytes[local_rank] : 0;
         if (i < 4)
             reinterpret_cast<uint8_t*>(&lo)[i] = code;
         else
@@ -155,7 +165,7 @@ __device__ __forceinline__ bf16 remnant_scale(
     int word,
     bool valid
 ) {
-    const uint8_t *scales = plan.remnant_scales[buf_idx] + row_slot * 8;
+    const uint8_t *scales = plan.remnant.scales[buf_idx] + row_slot * 8;
     const int code = valid ? static_cast<int>(scales[word]) : 0;
     return (bf16)__int_as_float(code << 23);
 }
