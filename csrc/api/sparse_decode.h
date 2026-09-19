@@ -5,8 +5,10 @@
 #include "params.h"
 
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
+#ifdef FLASHMLA_ENABLE_SM100
 #include "sm100/decode/head64/kernel.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#endif
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
 
@@ -105,6 +107,7 @@ protected:
     }
 };
 
+#ifdef FLASHMLA_ENABLE_SM100
 class Decode_Sm100_Head64_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
@@ -209,6 +212,7 @@ protected:
         sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::DecodeWithSplitKV, 512>(params);
     }
 };
+#endif
 
 template<bool REMNANT>
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
@@ -443,7 +447,9 @@ sparse_attn_decode_interface_impl(
     if constexpr (REMNANT) {
         TORCH_CHECK(arch.is_sm90a(), "Remnant direct decode currently requires SM90a");
         impl = new Decode_Sm90_Remnant_Impl();
-    } else if (arch.is_sm100f()) {
+    }
+#ifdef FLASHMLA_ENABLE_SM100
+    else if (arch.is_sm100f()) {
         if (h_q == 64) {
             impl = new Decode_Sm100_Head64_Impl();
         } else if (h_q == 128) {
@@ -457,7 +463,9 @@ sparse_attn_decode_interface_impl(
         } else {
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
-    } else if (arch.is_sm90a()) {
+    }
+#endif
+    else if (arch.is_sm90a()) {
         impl = new Decode_Sm90_Impl();
     } else {
         TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
