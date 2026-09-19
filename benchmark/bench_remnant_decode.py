@@ -67,6 +67,7 @@ def main() -> None:
     parser.add_argument("--batches", default="8,16")
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--max-regression-percent", type=float, default=2.0)
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires an H100")
@@ -74,7 +75,8 @@ def main() -> None:
         raise RuntimeError("Direct Remnant decode currently targets SM90")
 
     print("heads,batch,topk,native_total_ms,adapter_total_ms,direct_total_ms,"
-          "native_kernel_ms,adapter_kernel_ms,direct_kernel_ms,direct_vs_native_pct")
+          "native_kernel_ms,adapter_kernel_ms,direct_kernel_ms,direct_vs_native_pct,status")
+    misses = []
     for heads in (64, 128):
         for batch in (int(value) for value in args.batches.split(",")):
             case = make_case(heads, 512, batch=batch)
@@ -86,11 +88,19 @@ def main() -> None:
             adapter_kernel = _kernel_time(lambda: _adapter(case, meta))
             direct_kernel = _kernel_time(lambda: _direct(case, meta))
             delta = 100.0 * (direct_total / native_total - 1.0)
+            status = "PASS" if delta <= args.max_regression_percent else "MISS"
+            if status == "MISS":
+                misses.append((heads, batch, delta))
             print(
                 f"{heads},{batch},512,"
                 f"{native_total:.4f},{adapter_total:.4f},{direct_total:.4f},"
-                f"{native_kernel:.4f},{adapter_kernel:.4f},{direct_kernel:.4f},{delta:.3f}"
+                f"{native_kernel:.4f},{adapter_kernel:.4f},{direct_kernel:.4f},{delta:.3f},{status}"
             )
+    if misses:
+        details = ", ".join(f"H{heads}/B{batch}={delta:.2f}%" for heads, batch, delta in misses)
+        raise RuntimeError(
+            f"direct decode exceeds the {args.max_regression_percent:.2f}% target: {details}"
+        )
 
 
 if __name__ == "__main__":

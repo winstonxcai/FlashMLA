@@ -196,7 +196,9 @@ def make_case(
         (batch_index * PAGE_SIZE + torch.arange(512, device=device, dtype=torch.int32) % PAGE_SIZE)
         for batch_index in range(batch)
     ]).view(batch, 1, 512)
-    raw_indices = packed_indices + 3
+    raw_indices = packed_indices + 3 + (
+        torch.arange(512, device=device, dtype=torch.int32).view(1, 1, 512) % 11
+    )
     if topk_length < 512:
         packed_indices = packed_indices.clone()
         raw_indices = raw_indices.clone()
