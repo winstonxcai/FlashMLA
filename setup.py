@@ -103,9 +103,6 @@ flashmla_sources = [
             "csrc/sm100/decode/head64/instantiations/model1.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
 ]
-if is_flag_set("FLASH_MLA_DISABLE_SM100"):
-    flashmla_sources = [source for source in flashmla_sources if "/sm100/" not in source]
-
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
