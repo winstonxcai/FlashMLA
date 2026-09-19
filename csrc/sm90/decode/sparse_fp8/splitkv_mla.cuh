@@ -185,6 +185,81 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
 }
 
 template <typename Plan>
+__device__ __forceinline__ fp8x16 load_remnant_fp8x16(
+    const Plan &plan,
+    int buf_idx,
+    int row_slot,
+    int dim_base,
+    bool valid
+) {
+    fp8x16 result;
+    uint32_t output0 = 0;
+    uint32_t output1 = 0;
+    uint32_t output2 = 0;
+    uint32_t output3 = 0;
+    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
+    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
+    const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
+    const int word = dim_base / 64;
+    const uint64_t keep = valid ? bitmap[word] : 0;
+    const int byte_in_word = (dim_base & 63) >> 3;
+    const uint8_t first_mask = static_cast<uint8_t>(
+        (keep >> (56 - byte_in_word * 8)) & 0xffu
+    );
+    const uint8_t second_mask = static_cast<uint8_t>(
+        (keep >> (48 - byte_in_word * 8)) & 0xffu
+    );
+    const uint64_t prior_mask = byte_in_word == 0
+        ? 0ULL
+        : (~0ULL << (64 - byte_in_word * 8));
+    const int rank_base = prefix[word] + __popcll(keep & prior_mask);
+    const uint32_t first_rank_pack = remnant_byte_rank_pack(first_mask);
+    const uint32_t second_rank_pack = remnant_byte_rank_pack(second_mask);
+    const int second_rank_base = rank_base + __popc(first_mask);
+    const int aligned_base = rank_base & ~15;
+    uint4 survivor_window_first = {};
+    uint4 survivor_window_second = {};
+    if (valid) {
+        survivor_window_first = *reinterpret_cast<const uint4 *>(values + aligned_base);
+        survivor_window_second = *reinterpret_cast<const uint4 *>(values + aligned_base + 16);
+    }
+    CUTE_UNROLL
+    for (int i = 0; i < 16; ++i) {
+        const bool in_first_byte = i < 8;
+        const int bit_in_byte = i & 7;
+        const uint8_t byte_mask = in_first_byte ? first_mask : second_mask;
+        const uint32_t rank_pack = in_first_byte ? first_rank_pack : second_rank_pack;
+        const int rank_shift = bit_in_byte < 4
+            ? 16 + 4 * bit_in_byte
+            : 4 * (bit_in_byte - 4);
+        const int rank = (in_first_byte ? rank_base : second_rank_base)
+            + ((rank_pack >> rank_shift) & 0xf);
+        const bool kept = ((byte_mask >> (7 - bit_in_byte)) & 1u) != 0;
+        const uint8_t code = valid && kept
+            ? remnant_register_byte(
+                  survivor_window_first,
+                  survivor_window_second,
+                  rank - aligned_base
+              )
+            : 0;
+        const uint32_t packed_code = static_cast<uint32_t>(code) << ((i & 3) * 8);
+        if (i < 4)
+            output0 |= packed_code;
+        else if (i < 8)
+            output1 |= packed_code;
+        else if (i < 12)
+            output2 |= packed_code;
+        else
+            output3 |= packed_code;
+    }
+    *reinterpret_cast<uint32_t *>(&result.lo.lo) = output0;
+    *reinterpret_cast<uint32_t *>(&result.lo.hi) = output1;
+    *reinterpret_cast<uint32_t *>(&result.hi.lo) = output2;
+    *reinterpret_cast<uint32_t *>(&result.hi.hi) = output3;
+    return result;
+}
+
+template <typename Plan>
 __device__ __forceinline__ bf16 remnant_scale(
     const Plan &plan,
     int buf_idx,
@@ -785,11 +860,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                         const int packed_row = valid ? rel_idx_in_block : 0;
                         for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE / 64; ++dim_idx) {
                             const int dim_base = dim_idx * 64 + value_base_dim;
-                            fp8x8 first = load_remnant_fp8x8(plan, buf_idx, remnant_row_slot, dim_base, valid);
-                            fp8x8 second = load_remnant_fp8x8(plan, buf_idx, remnant_row_slot, dim_base + 8, valid);
+                            fp8x16 packed = load_remnant_fp8x16(
+                                plan, buf_idx, remnant_row_slot, dim_base, valid
+                            );
                             bf16 scale = remnant_scale(plan, buf_idx, remnant_row_slot, dim_idx, valid);
-                            bf16x8 first_bf16 = cvt_fp8x8_bf16x8(first, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
-                            bf16x8 second_bf16 = cvt_fp8x8_bf16x8(second, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            bf16x8 first_bf16 = cvt_fp8x8_bf16x8(packed.lo, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            bf16x8 second_bf16 = cvt_fp8x8_bf16x8(packed.hi, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
                             if (!valid) {
                                 *(uint128_t*)(&first_bf16) = uint128_t();
                                 *(uint128_t*)(&second_bf16) = uint128_t();
