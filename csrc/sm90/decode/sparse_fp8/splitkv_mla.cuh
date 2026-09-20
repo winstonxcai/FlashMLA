@@ -154,6 +154,9 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     // coordinates can therefore span 24 bytes, so a single 16-byte window is
     // not sufficient.  The staged row has 16 bytes of zero padding, making
     // this bounded 32-byte read safe even for the final fragment.
+    const int aligned_rank_base = rank_base & ~15;
+    const uint4 first_window = *reinterpret_cast<const uint4 *>(values + aligned_rank_base);
+    const uint4 second_window = *reinterpret_cast<const uint4 *>(values + aligned_rank_base + 16);
     CUTE_UNROLL
     for (int i = 0; i < 8; ++i) {
         const int bit = dim_base + i;
@@ -161,7 +164,9 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
         const bool kept = ((keep >> (63 - lane)) & 1ULL) != 0;
         const int rank_shift = i < 4 ? 16 + 4 * i : 4 * (i - 4);
         const int rank = rank_base + ((rank_pack >> rank_shift) & 0xf);
-        const uint8_t code = valid && kept ? values[rank] : 0;
+        const uint8_t code = valid && kept
+            ? remnant_register_byte(first_window, second_window, rank - aligned_rank_base)
+            : 0;
         if (i < 4)
             reinterpret_cast<uint8_t*>(&lo)[i] = code;
         else
@@ -204,6 +209,9 @@ __device__ __forceinline__ fp8x16 load_remnant_fp8x16(
     const uint32_t first_rank_pack = remnant_byte_rank_pack(first_mask);
     const uint32_t second_rank_pack = remnant_byte_rank_pack(second_mask);
     const int second_rank_base = rank_base + __popc(first_mask);
+    const int aligned_rank_base = rank_base & ~15;
+    const uint4 first_window = *reinterpret_cast<const uint4 *>(values + aligned_rank_base);
+    const uint4 second_window = *reinterpret_cast<const uint4 *>(values + aligned_rank_base + 16);
     CUTE_UNROLL
     for (int i = 0; i < 16; ++i) {
         const bool in_first_byte = i < 8;
@@ -216,7 +224,9 @@ __device__ __forceinline__ fp8x16 load_remnant_fp8x16(
         const int rank = (in_first_byte ? rank_base : second_rank_base)
             + ((rank_pack >> rank_shift) & 0xf);
         const bool kept = ((byte_mask >> (7 - bit_in_byte)) & 1u) != 0;
-        const uint8_t code = valid && kept ? values[rank] : 0;
+        const uint8_t code = valid && kept
+            ? remnant_register_byte(first_window, second_window, rank - aligned_rank_base)
+            : 0;
         const uint32_t packed_code = static_cast<uint32_t>(code) << ((i & 3) * 8);
         if (i < 4)
             output0 |= packed_code;
