@@ -66,7 +66,10 @@ def _run_remnant(case):
 @pytest.mark.parametrize("topk_length", [512, 317])
 def test_direct_decode_matches_native_adapter(num_heads: int, batch: int, topk_length: int):
     case = make_case(num_heads, topk_length, batch=batch)
-    native_code_bytes = case.native_cache[..., :448].contiguous()
+    # The public [page, token, 1, 584] view has a synthetic row width; the
+    # decoder addresses the physical 576-byte data rows plus the page scale
+    # tail. Inspect the backing page bytes for the native-code check.
+    native_code_bytes = case.native_storage[:, : 64 * 576].view(-1, 64, 576)[..., :448]
     packed_code_bytes = case.packed_buffers[0]
     # E4M3FN reserves both sign variants of exponent=15, mantissa=7 for NaN.
     native_nan_codes = ((native_code_bytes & 0x7F) == 0x7F).sum().item()
