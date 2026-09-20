@@ -50,6 +50,15 @@ def _pack(latent: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]
     scale = torch.exp2(exponent.float())
     quantized = (tiles / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
     quantized_bytes = quantized.view(torch.uint8).reshape(-1, HEAD_DIM)
+    # E4M3FN reserves the two exponent=15/mantissa=7 encodings as NaN.  Some
+    # CUDA/PyTorch conversion paths round the finite endpoint to those byte
+    # patterns, so explicitly map them to the signed finite maximum.
+    nan_codes = (quantized_bytes & 0x7F) == 0x7F
+    quantized_bytes = torch.where(
+        nan_codes,
+        (quantized_bytes & 0x80) | 0x7E,
+        quantized_bytes,
+    )
     columns = mask.nonzero(as_tuple=False)[:, 1].reshape(-1, KEEP_K)
     values = quantized_bytes.gather(1, columns).reshape(-1, PAGE_SIZE, KEEP_K)
     bitmaps = _bitmap(mask).reshape(-1, PAGE_SIZE, 8)
