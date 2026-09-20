@@ -227,23 +227,24 @@ def make_case(
         packed, mask, packed_indices, raw_indices, freqs
     )
     q = torch.randn((batch, 1, num_heads, HEAD_DIM), device=device, dtype=torch.bfloat16)
+    bytes_per_page = ((PAGE_SIZE * 584 + 575) // 576) * 576
     swa_storage = torch.zeros(
-        (batch, PAGE_SIZE * 584), dtype=torch.uint8, device=device
+        (batch, bytes_per_page), dtype=torch.uint8, device=device
     )
     swa_cache = swa_storage.as_strided(
-        (batch, PAGE_SIZE, 1, 584), (PAGE_SIZE * 584, 584, 584, 1)
+        (batch, PAGE_SIZE, 1, 584), (bytes_per_page, 584, 584, 1)
     )
-    swa_flat = swa_cache.reshape(batch * PAGE_SIZE, 584)
-    swa_flat[:, :448].copy_(
+    swa_data = swa_storage[:, : PAGE_SIZE * 576].view(batch, PAGE_SIZE, 576)
+    swa_data[..., :448].copy_(
         (torch.arange(batch * PAGE_SIZE * 448, device=device) % 113 + 1)
         .to(torch.uint8)
-        .view(batch * PAGE_SIZE, 448)
+        .view(batch, PAGE_SIZE, 448)
     )
     swa_tail = torch.linspace(-0.25, 0.25, batch * PAGE_SIZE * 64, device=device)
-    swa_flat[:, 448:576].copy_(
-        swa_tail.to(torch.bfloat16).view(torch.uint8).reshape(batch * PAGE_SIZE, 128)
+    swa_data[..., 448:576].copy_(
+        swa_tail.to(torch.bfloat16).view(torch.uint8).reshape(batch, PAGE_SIZE, 128)
     )
-    swa_flat[:, 576:584].fill_(127)
+    swa_storage[:, PAGE_SIZE * 576 : PAGE_SIZE * 584].view(batch, PAGE_SIZE, 8).fill_(127)
     swa_indices = torch.arange(PAGE_SIZE, device=device, dtype=torch.int32).view(1, 1, PAGE_SIZE)
     swa_indices = (swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1, 1) * PAGE_SIZE).contiguous()
     swa_length = torch.full((batch,), PAGE_SIZE, dtype=torch.int32, device=device)
