@@ -66,10 +66,13 @@ def _run_remnant(case):
 @pytest.mark.parametrize("topk_length", [512, 317])
 def test_direct_decode_matches_native_adapter(num_heads: int, batch: int, topk_length: int):
     case = make_case(num_heads, topk_length, batch=batch)
-    native_codes = case.native_cache[..., :448].contiguous().view(torch.float8_e4m3fn)
-    packed_codes = case.packed_buffers[0].view(torch.float8_e4m3fn)
-    assert torch.isfinite(native_codes).all(), "Native cache contains non-finite FP8 codes"
-    assert torch.isfinite(packed_codes).all(), "Packed cache contains non-finite FP8 codes"
+    native_code_bytes = case.native_cache[..., :448].contiguous()
+    packed_code_bytes = case.packed_buffers[0]
+    # E4M3FN reserves both sign variants of exponent=15, mantissa=7 for NaN.
+    native_nan_codes = ((native_code_bytes & 0x7F) == 0x7F).sum().item()
+    packed_nan_codes = ((packed_code_bytes & 0x7F) == 0x7F).sum().item()
+    assert native_nan_codes == 0, f"Native cache contains {native_nan_codes} NaN FP8 codes"
+    assert packed_nan_codes == 0, f"Packed cache contains {packed_nan_codes} NaN FP8 codes"
     native_out, native_lse = _run_native(case)
     direct_out, direct_lse = _run_remnant(case)
     assert torch.isfinite(native_out).all(), "Native reference output is non-finite"
