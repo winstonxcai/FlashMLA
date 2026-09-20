@@ -68,6 +68,10 @@ def test_direct_decode_matches_native_adapter(num_heads: int, batch: int, topk_l
     case = make_case(num_heads, topk_length, batch=batch)
     native_out, native_lse = _run_native(case)
     direct_out, direct_lse = _run_remnant(case)
+    assert torch.isfinite(native_out).all(), "Native reference output is non-finite"
+    assert torch.isfinite(native_lse).all(), "Native reference LSE is non-finite"
+    assert torch.isfinite(direct_out).all(), "Direct Remnant output is non-finite"
+    assert torch.isfinite(direct_lse).all(), "Direct Remnant LSE is non-finite"
     torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
     torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
 
