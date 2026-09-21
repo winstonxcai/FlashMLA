@@ -856,7 +856,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
 
                         // The packed record contains the unrotated tail. Apply
                         // the model's four-position RoPE stride before storing it.
-                        const uint64_t rope_keep = valid ? plan.remnant.bitmaps[buf_idx][remnant_row_slot * 8 + 7] : 0ULL;
                         for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE / 32; ++dim_idx) {
                             const int rope_base_dim = (lane_idx / 8) * 8;
                             const int dim_base = HEAD_DIM_NOPE + dim_idx * 32 + rope_base_dim;
@@ -871,10 +870,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                             };
                             if (valid) {
                                 for (int pair = 0; pair < 4; ++pair) {
-                                    const int local_pair = dim_idx * 32 + rope_base_dim + pair * 2;
-                                    const bool pair_kept = ((rope_keep >> (62 - local_pair)) & 0x3ULL) != 0;
-                                    if (!pair_kept)
-                                        continue;
                                     const int freq = raw_token_index * 4 * 32 + dim_idx * 16 + (rope_base_dim + pair * 2) / 2;
                                     const float c = __ldg(params.remnant_freqs + freq * 2);
                                     const float s = __ldg(params.remnant_freqs + freq * 2 + 1);
