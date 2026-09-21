@@ -146,6 +146,12 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     const uint32_t word2 = *reinterpret_cast<const uint32_t *>(
         values + aligned_rank_base + 8
     );
+    // The second four-coordinate group may start before the aligned four-byte
+    // base when the first four logical coordinates contain zeros. Select the
+    // two-word window from the first or second pair accordingly.
+    const int second_start_rank = rank_base + ((rank_pack >> 0) & 0xf);
+    const int second_window_base =
+        ((second_start_rank - aligned_rank_base) >= 4) ? 4 : 0;
     uint32_t selector_first = 0;
     uint32_t selector_second = 0;
     uint32_t keep_first = 0;
@@ -162,14 +168,16 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
             if (kept)
                 keep_first |= 0xffu << (i * 8);
         } else {
-            selector_second |= static_cast<uint32_t>(relative_rank - 4)
+            selector_second |= static_cast<uint32_t>(relative_rank - second_window_base)
                 << ((i - 4) * 4);
             if (kept)
                 keep_second |= 0xffu << ((i - 4) * 8);
         }
     }
     lo = __byte_perm(word0, word1, selector_first) & keep_first;
-    hi = __byte_perm(word1, word2, selector_second) & keep_second;
+    hi = (second_window_base == 0
+        ? __byte_perm(word0, word1, selector_second)
+        : __byte_perm(word1, word2, selector_second)) & keep_second;
     *reinterpret_cast<uint32_t*>(&result.lo) = lo;
     *reinterpret_cast<uint32_t*>(&result.hi) = hi;
     return result;
