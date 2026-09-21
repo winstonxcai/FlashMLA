@@ -1,4 +1,7 @@
-"""Model-free steady-state Native, adapter, and direct Remnant decode timing."""
+"""Model-free steady-state Native, adapter, and direct Remnant decode timing.
+
+Author: Winston Cai.
+"""
 
 from __future__ import annotations
 

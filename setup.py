@@ -1,3 +1,8 @@
+"""Build configuration for the Remnant FlashMLA fork.
+
+Author: Winston Cai.
+"""
+
 import os
 from pathlib import Path
 from datetime import datetime

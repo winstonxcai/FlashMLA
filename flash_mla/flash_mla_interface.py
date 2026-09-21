@@ -1,3 +1,8 @@
+"""Python interface for the FlashMLA kernels.
+
+Author: Winston Cai.
+"""
+
 from typing import Optional, Tuple
 import dataclasses
 

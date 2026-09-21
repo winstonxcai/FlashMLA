@@ -1,3 +1,8 @@
+"""Remnant FlashMLA Python package exports.
+
+Author: Winston Cai.
+"""
+
 __version__ = "1.0.0"
 
 from flash_mla.flash_mla_interface import (

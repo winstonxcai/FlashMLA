@@ -1,4 +1,7 @@
-"""Small CUDA fixtures for direct Remnant FlashMLA tests and benchmarks."""
+"""Small CUDA fixtures for direct Remnant FlashMLA tests and benchmarks.
+
+Author: Winston Cai.
+"""
 
 from __future__ import annotations
 

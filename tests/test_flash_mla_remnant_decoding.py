@@ -1,4 +1,7 @@
-"""Direct Remnant decode parity and CUDA graph coverage."""
+"""Direct Remnant decode parity and CUDA graph coverage.
+
+Author: Winston Cai.
+"""
 
 import importlib.util
 

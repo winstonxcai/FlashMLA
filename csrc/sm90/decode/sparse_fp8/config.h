@@ -1,3 +1,5 @@
+// Authored by Winston Cai.
+
 #pragma once
 
 #include <cutlass/numeric_types.h>

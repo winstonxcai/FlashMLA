@@ -1,3 +1,5 @@
+// Authored by Winston Cai.
+
 #include "../splitkv_mla.cuh"
 
 namespace sm90::decode::sparse_fp8 {
