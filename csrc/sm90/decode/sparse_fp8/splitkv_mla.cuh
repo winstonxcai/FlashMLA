@@ -39,28 +39,6 @@ __device__ __forceinline__ uint32_t remnant_byte_rank_pack(uint8_t bits) {
     return (high << 16) | (low + __popc(bits >> 4) * 0x1111u);
 }
 
-// Keep the survivor window in named registers.  Indexing a byte through an
-// address-taken uint4 array makes nvcc materialize that array in thread-local
-// memory, adding an LDL/STL pair for every reconstructed fragment.
-__device__ __forceinline__ uint8_t remnant_register_byte(
-    const uint4 &first,
-    const uint4 &second,
-    int byte_index
-) {
-    uint32_t word;
-    switch (byte_index >> 2) {
-        case 0: word = first.x; break;
-        case 1: word = first.y; break;
-        case 2: word = first.z; break;
-        case 3: word = first.w; break;
-        case 4: word = second.x; break;
-        case 5: word = second.y; break;
-        case 6: word = second.z; break;
-        default: word = second.w; break;
-    }
-    return static_cast<uint8_t>(word >> ((byte_index & 3) * 8));
-}
-
 template <typename Plan>
 __device__ __forceinline__ void prepare_remnant_row(
     const SparseAttnDecodeParams &params,
@@ -145,28 +123,53 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     const uint8_t byte_mask = static_cast<uint8_t>(
         (keep >> (56 - byte_in_word * 8)) & 0xffu
     );
+    if (!valid || byte_mask == 0) {
+        *reinterpret_cast<uint32_t *>(&result.lo) = 0;
+        *reinterpret_cast<uint32_t *>(&result.hi) = 0;
+        return result;
+    }
     const uint64_t prior_mask = byte_in_word == 0
         ? 0ULL
         : (~0ULL << (64 - byte_in_word * 8));
     const int rank_base = prefix[word] + __popcll(keep & prior_mask);
     const uint32_t rank_pack = remnant_byte_rank_pack(byte_mask);
-    // A fragment can begin at any survivor rank modulo 16.  Eight logical
-    // coordinates can therefore span 24 bytes, so a single 16-byte window is
-    // not sufficient.  The staged row has 16 bytes of zero padding, making
-    // this bounded 32-byte read safe even for the final fragment.
+    // The first and second four-byte output groups have rank offsets in
+    // [0, 6] and [4, 10], respectively. Three aligned words therefore cover
+    // every possible eight-survivor fragment, including the padded tail.
+    const int aligned_rank_base = rank_base & ~3;
+    const uint32_t word0 = *reinterpret_cast<const uint32_t *>(
+        values + aligned_rank_base
+    );
+    const uint32_t word1 = *reinterpret_cast<const uint32_t *>(
+        values + aligned_rank_base + 4
+    );
+    const uint32_t word2 = *reinterpret_cast<const uint32_t *>(
+        values + aligned_rank_base + 8
+    );
+    uint32_t selector_first = 0;
+    uint32_t selector_second = 0;
+    uint32_t keep_first = 0;
+    uint32_t keep_second = 0;
     CUTE_UNROLL
     for (int i = 0; i < 8; ++i) {
-        const int bit = dim_base + i;
-        const int lane = bit & 63;
+        const int lane = (dim_base + i) & 63;
         const bool kept = ((keep >> (63 - lane)) & 1ULL) != 0;
         const int rank_shift = i < 4 ? 16 + 4 * i : 4 * (i - 4);
         const int rank = rank_base + ((rank_pack >> rank_shift) & 0xf);
-        const uint8_t code = valid && kept ? values[rank] : 0;
-        if (i < 4)
-            reinterpret_cast<uint8_t*>(&lo)[i] = code;
-        else
-            reinterpret_cast<uint8_t*>(&hi)[i - 4] = code;
+        const int relative_rank = rank - aligned_rank_base;
+        if (i < 4) {
+            selector_first |= static_cast<uint32_t>(relative_rank) << (i * 4);
+            if (kept)
+                keep_first |= 0xffu << (i * 8);
+        } else {
+            selector_second |= static_cast<uint32_t>(relative_rank - 4)
+                << ((i - 4) * 4);
+            if (kept)
+                keep_second |= 0xffu << ((i - 4) * 8);
+        }
     }
+    lo = __byte_perm(word0, word1, selector_first) & keep_first;
+    hi = __byte_perm(word1, word2, selector_second) & keep_second;
     *reinterpret_cast<uint32_t*>(&result.lo) = lo;
     *reinterpret_cast<uint32_t*>(&result.hi) = hi;
     return result;
@@ -180,57 +183,11 @@ __device__ __forceinline__ fp8x16 load_remnant_fp8x16(
     int dim_base,
     bool valid
 ) {
+    // Reuse the eight-coordinate path twice. Each call performs three aligned
+    // shared loads and one pair of byte permutations for its fragment.
     fp8x16 result;
-    uint32_t output0 = 0;
-    uint32_t output1 = 0;
-    uint32_t output2 = 0;
-    uint32_t output3 = 0;
-    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
-    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
-    const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
-    const int word = dim_base / 64;
-    const uint64_t keep = valid ? bitmap[word] : 0;
-    const int byte_in_word = (dim_base & 63) >> 3;
-    const uint8_t first_mask = static_cast<uint8_t>(
-        (keep >> (56 - byte_in_word * 8)) & 0xffu
-    );
-    const uint8_t second_mask = static_cast<uint8_t>(
-        (keep >> (48 - byte_in_word * 8)) & 0xffu
-    );
-    const uint64_t prior_mask = byte_in_word == 0
-        ? 0ULL
-        : (~0ULL << (64 - byte_in_word * 8));
-    const int rank_base = prefix[word] + __popcll(keep & prior_mask);
-    const uint32_t first_rank_pack = remnant_byte_rank_pack(first_mask);
-    const uint32_t second_rank_pack = remnant_byte_rank_pack(second_mask);
-    const int second_rank_base = rank_base + __popc(first_mask);
-    CUTE_UNROLL
-    for (int i = 0; i < 16; ++i) {
-        const bool in_first_byte = i < 8;
-        const int bit_in_byte = i & 7;
-        const uint8_t byte_mask = in_first_byte ? first_mask : second_mask;
-        const uint32_t rank_pack = in_first_byte ? first_rank_pack : second_rank_pack;
-        const int rank_shift = bit_in_byte < 4
-            ? 16 + 4 * bit_in_byte
-            : 4 * (bit_in_byte - 4);
-        const int rank = (in_first_byte ? rank_base : second_rank_base)
-            + ((rank_pack >> rank_shift) & 0xf);
-        const bool kept = ((byte_mask >> (7 - bit_in_byte)) & 1u) != 0;
-        const uint8_t code = valid && kept ? values[rank] : 0;
-        const uint32_t packed_code = static_cast<uint32_t>(code) << ((i & 3) * 8);
-        if (i < 4)
-            output0 |= packed_code;
-        else if (i < 8)
-            output1 |= packed_code;
-        else if (i < 12)
-            output2 |= packed_code;
-        else
-            output3 |= packed_code;
-    }
-    *reinterpret_cast<uint32_t *>(&result.lo.lo) = output0;
-    *reinterpret_cast<uint32_t *>(&result.lo.hi) = output1;
-    *reinterpret_cast<uint32_t *>(&result.hi.lo) = output2;
-    *reinterpret_cast<uint32_t *>(&result.hi.hi) = output3;
+    result.lo = load_remnant_fp8x8(plan, buf_idx, row_slot, dim_base, valid);
+    result.hi = load_remnant_fp8x8(plan, buf_idx, row_slot, dim_base + 8, valid);
     return result;
 }
 
