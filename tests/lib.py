@@ -1,3 +1,8 @@
+"""Shared FlashMLA test infrastructure and Remnant decode fixtures.
+
+Author: Winston Cai.
+"""
+
 import dataclasses
 import os
 import enum
@@ -9,6 +14,335 @@ import kernelkit as kk
 import flash_mla
 
 import quant
+
+
+# Remnant's Packed C4 test ABI.  These helpers intentionally live beside the
+# upstream test generators so Remnant tests share the same device/setup
+# conventions without making the production FlashMLA package depend on the
+# outer SGLang repository.
+REMNANT_HEAD_DIM = 512
+REMNANT_NOPE_DIM = 448
+REMNANT_ROPE_DIM = 64
+REMNANT_KEEP_K = 256
+REMNANT_PAGE_SIZE = 64
+
+
+@dataclasses.dataclass
+class RemnantCase:
+    q: torch.Tensor
+    swa_cache: torch.Tensor
+    swa_indices: torch.Tensor
+    swa_length: torch.Tensor
+    packed_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    packed_indices: torch.Tensor
+    raw_indices: torch.Tensor
+    extra_length: torch.Tensor
+    freqs: torch.Tensor
+    native_cache: torch.Tensor
+    native_indices: torch.Tensor
+    native_storage: torch.Tensor
+    mask: torch.Tensor
+    sink: torch.Tensor
+    sm_scale: float
+
+
+def _remnant_bitmap(mask: torch.Tensor) -> torch.Tensor:
+    shifts = (1 << (63 - torch.arange(64, device=mask.device))).to(torch.int64)
+    bits = mask.reshape(mask.shape[0], 8, 64).to(torch.int64)
+    return (bits * shifts.view(1, 1, 64)).sum(-1).view(torch.uint64)
+
+
+def _remnant_pack(
+    latent: torch.Tensor,
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    mask = torch.zeros_like(latent, dtype=torch.bool)
+    keep = latent.abs().topk(REMNANT_KEEP_K, dim=-1, largest=True).indices
+    mask.scatter_(1, keep, True)
+    masked = latent.masked_fill(~mask, 0).to(torch.bfloat16).float()
+    tiles = masked.reshape(-1, 8, 64)
+    max_abs = tiles.abs().amax(-1).clamp_min(1.0e-4)
+    exponent = torch.ceil(torch.log2(max_abs / 448.0)).to(torch.int32)
+    scale = torch.exp2(exponent.float())
+    quantized = (tiles / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+    quantized_bytes = quantized.view(torch.uint8).reshape(-1, REMNANT_HEAD_DIM)
+    # Avoid the two E4M3FN NaN encodings when conversion rounds the finite
+    # endpoint up to exponent=15, mantissa=7.
+    nan_codes = (quantized_bytes & 0x7F) == 0x7F
+    quantized_bytes = torch.where(
+        nan_codes,
+        (quantized_bytes & 0x80) | 0x7E,
+        quantized_bytes,
+    )
+    columns = mask.nonzero(as_tuple=False)[:, 1].reshape(-1, REMNANT_KEEP_K)
+    values = quantized_bytes.gather(1, columns).reshape(-1, REMNANT_PAGE_SIZE, REMNANT_KEEP_K)
+    bitmaps = _remnant_bitmap(mask).reshape(-1, REMNANT_PAGE_SIZE, 8)
+    scales = (exponent + 127).to(torch.uint8).reshape(-1, REMNANT_PAGE_SIZE, 8)
+    return (values, bitmaps, scales), mask
+
+
+def _remnant_decode_packed(
+    buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    values, _, scales = buffers
+    codes = values.reshape(-1, REMNANT_KEEP_K).view(torch.float8_e4m3fn).float()
+    scale = torch.exp2(scales.reshape(-1, 8).to(torch.int32).float() - 127)
+    ranks = mask.to(torch.int32).cumsum(-1) - 1
+    full_codes = codes.gather(1, ranks.clamp_min(0))
+    decoded = full_codes * scale.repeat_interleave(64, -1)
+    decoded = torch.where(mask, decoded, torch.zeros_like(decoded))
+    return decoded.to(torch.bfloat16)
+
+
+def _remnant_make_freqs(max_position: int, device: torch.device) -> torch.Tensor:
+    pair = torch.arange(32, device=device, dtype=torch.float32)
+    pos = torch.arange(max_position, device=device, dtype=torch.float32)[:, None]
+    angle = (pos + 1.0) * (pair + 1.0) * 0.0017
+    table = torch.zeros((1, max_position * 128 + 32, 2), device=device)
+    table[..., 0] = 1.0
+    table[0, : max_position * 128].view(max_position, 128, 2)[:, :32, 0] = torch.cos(angle)
+    table[0, : max_position * 128].view(max_position, 128, 2)[:, :32, 1] = torch.sin(angle)
+    return table.contiguous()
+
+
+def _remnant_native_from_packed(
+    buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    mask: torch.Tensor,
+    physical: torch.Tensor,
+    raw: torch.Tensor,
+    freqs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    values, _, scales = buffers
+    batch, _, selected_k = physical.shape
+    rows = raw.numel()
+    pages = (rows + REMNANT_PAGE_SIZE - 1) // REMNANT_PAGE_SIZE
+    bytes_per_page = ((REMNANT_PAGE_SIZE * 584 + 575) // 576) * 576
+    storage = torch.zeros((pages, bytes_per_page), dtype=torch.uint8, device=raw.device)
+    flat_values = values.reshape(-1, REMNANT_KEEP_K)
+    flat_scales = scales.reshape(-1, 8)
+    flat_mask = mask.reshape(-1, REMNANT_HEAD_DIM)
+    ranks = flat_mask.to(torch.int32).cumsum(-1) - 1
+    decoded = _remnant_decode_packed(buffers, mask).reshape(-1, REMNANT_HEAD_DIM)
+    flat_physical = physical.reshape(-1)
+    flat_raw = raw.reshape(-1)
+    for row in range(rows):
+        page, offset = divmod(row, REMNANT_PAGE_SIZE)
+        data_base = offset * 576
+        scale_base = REMNANT_PAGE_SIZE * 576 + offset * 8
+        source = int(flat_physical[row].item())
+        tail = decoded[source : source + 1, REMNANT_NOPE_DIM:]
+        raw_position = flat_raw[row : row + 1].clamp_min(0)
+        flat_freqs = freqs.reshape(-1, 2)
+        freq_rows = flat_freqs.index_select(
+            0,
+            (raw_position.to(torch.long)[:, None] * 128 + torch.arange(32, device=raw.device)[None, :]).reshape(-1),
+        ).reshape(1, 32, 2)
+        x0 = tail.float().reshape(1, 32, 2)[..., 0]
+        x1 = tail.float().reshape(1, 32, 2)[..., 1]
+        rotated_tail = torch.stack(
+            (x0 * freq_rows[..., 0] - x1 * freq_rows[..., 1],
+             x0 * freq_rows[..., 1] + x1 * freq_rows[..., 0]),
+            dim=-1,
+        ).reshape(1, REMNANT_ROPE_DIM).to(torch.bfloat16)
+        codes = torch.zeros(REMNANT_NOPE_DIM, dtype=torch.uint8, device=raw.device)
+        kept = flat_mask[source, :REMNANT_NOPE_DIM]
+        codes[kept] = flat_values[source].index_select(0, ranks[source, :REMNANT_NOPE_DIM][kept])
+        storage[page, data_base : data_base + REMNANT_NOPE_DIM] = codes
+        storage[page, scale_base : scale_base + 8] = flat_scales[source, :8]
+        storage[page, data_base + REMNANT_NOPE_DIM : data_base + 576] = rotated_tail.view(torch.uint8)
+    native_cache = storage.as_strided(
+        (pages, REMNANT_PAGE_SIZE, 1, 584),
+        (bytes_per_page, 584, 584, 1),
+    )
+    native_indices = torch.arange(rows, dtype=torch.int32, device=raw.device).view(batch, 1, selected_k)
+    return native_cache, native_indices, storage
+
+
+def materialize_remnant_native(case: RemnantCase) -> None:
+    """Reconstruct selected Packed rows into the reusable Native workspace."""
+    values, _, scales = case.packed_buffers
+    source = case.packed_indices.reshape(-1)
+    raw = case.raw_indices.reshape(-1)
+    lengths = case.extra_length.repeat_interleave(case.packed_indices.shape[-1])
+    valid = torch.arange(source.numel(), device=source.device) % case.packed_indices.shape[-1] < lengths
+    flat_values = values.reshape(-1, REMNANT_KEEP_K)
+    flat_scales = scales.reshape(-1, 8)
+    flat_mask = case.mask.reshape(-1, REMNANT_HEAD_DIM)
+    ranks = flat_mask.to(torch.int32).cumsum(-1) - 1
+    selected_values = flat_values.index_select(0, source)
+    selected_mask = flat_mask.index_select(0, source)
+    selected_ranks = ranks.index_select(0, source).clamp_min(0)
+    codes = torch.gather(selected_values, 1, selected_ranks)
+    codes = torch.where(selected_mask, codes, torch.zeros_like(codes))
+
+    decoded = _remnant_decode_packed(case.packed_buffers, case.mask)
+    tail = decoded.index_select(0, source)[:, REMNANT_NOPE_DIM:].float().reshape(-1, 32, 2)
+    freq_rows = case.freqs.reshape(-1, 2).index_select(
+        0,
+        (raw.clamp_min(0).to(torch.long)[:, None] * 128 + torch.arange(32, device=raw.device)[None, :]).reshape(-1),
+    ).reshape(-1, 32, 2)
+    x0 = tail[..., 0].clone()
+    x1 = tail[..., 1].clone()
+    rotated = torch.stack(
+        (x0 * freq_rows[..., 0] - x1 * freq_rows[..., 1],
+         x0 * freq_rows[..., 1] + x1 * freq_rows[..., 0]),
+        dim=-1,
+    )
+    tail_bytes = rotated.reshape(-1, REMNANT_ROPE_DIM).to(torch.bfloat16).view(torch.uint8)
+    codes = torch.cat((codes[:, :REMNANT_NOPE_DIM], tail_bytes), dim=1)
+    codes = torch.where(valid[:, None], codes, torch.zeros_like(codes))
+    selected_scales = flat_scales.index_select(0, source)
+    selected_scales = torch.where(valid[:, None], selected_scales, torch.zeros_like(selected_scales))
+
+    case.native_storage.zero_()
+    for page in range(case.native_storage.shape[0]):
+        begin = page * REMNANT_PAGE_SIZE
+        end = begin + REMNANT_PAGE_SIZE
+        case.native_storage[page, : REMNANT_PAGE_SIZE * 576].view(REMNANT_PAGE_SIZE, 576).copy_(codes[begin:end])
+        case.native_storage[page, REMNANT_PAGE_SIZE * 576 : REMNANT_PAGE_SIZE * 584].copy_(selected_scales[begin:end].reshape(-1))
+
+
+def make_remnant_case(
+    num_heads: int,
+    topk_length: int,
+    batch: int = 1,
+    device: torch.device | str = "cuda",
+    unique_selections: bool = False,
+) -> RemnantCase:
+    device = torch.device(device)
+    base_params = TestParam(
+        s_q=1,
+        s_kv=REMNANT_PAGE_SIZE,
+        topk=REMNANT_PAGE_SIZE,
+        h_q=num_heads,
+        h_kv=1,
+        d_qk=REMNANT_HEAD_DIM,
+        d_v=REMNANT_HEAD_DIM,
+        decode=ExtraTestParamForDecode(
+            b=batch,
+            is_varlen=False,
+            have_zero_seqlen_k=False,
+            block_size=REMNANT_PAGE_SIZE,
+        ),
+    )
+    previous_default_device = torch.get_default_device()
+    torch.set_default_device(device)
+    try:
+        base_case = generate_testcase_for_decode(base_params)
+    finally:
+        torch.set_default_device(previous_default_device)
+
+    rows_per_request = 512 if unique_selections else REMNANT_PAGE_SIZE
+    rows = max(REMNANT_PAGE_SIZE, batch * rows_per_request)
+    latent = torch.randn((rows, REMNANT_HEAD_DIM), device=device)
+    packed, mask = _remnant_pack(latent)
+    packed_indices = torch.stack([
+        batch_index * rows_per_request
+        + torch.arange(512, device=device, dtype=torch.int32) % rows_per_request
+        for batch_index in range(batch)
+    ]).view(batch, 1, 512)
+    if unique_selections:
+        raw_indices = packed_indices * 3 + 17
+    else:
+        raw_indices = packed_indices + 3 + torch.arange(512, device=device, dtype=torch.int32).view(1, 1, 512) % 11
+    if topk_length < 512:
+        packed_indices = packed_indices.clone()
+        raw_indices = raw_indices.clone()
+        packed_indices[:, :, topk_length:] = 0
+        raw_indices[:, :, topk_length:] = -1
+    extra_length = torch.full((batch,), topk_length, dtype=torch.int32, device=device)
+    freqs = _remnant_make_freqs(max(128, int(raw_indices.max().item()) + 2), device)
+    native_cache, native_indices, native_storage = _remnant_native_from_packed(
+        packed, mask, packed_indices, raw_indices, freqs
+    )
+    q = base_case.q.to(device=device, dtype=torch.bfloat16).contiguous()
+    swa_cache = base_case.kv_scope.get_kvcache_for_flash_mla()
+    swa_indices = base_case.kv_scope.indices_in_kvcache
+    swa_length = torch.full((batch,), REMNANT_PAGE_SIZE, dtype=torch.int32, device=device)
+    sink = torch.linspace(-0.1, 0.1, num_heads, device=device)
+    return RemnantCase(
+        q=q,
+        swa_cache=swa_cache,
+        swa_indices=swa_indices,
+        swa_length=swa_length,
+        packed_buffers=packed,
+        packed_indices=packed_indices.contiguous(),
+        raw_indices=raw_indices.contiguous(),
+        extra_length=extra_length,
+        freqs=freqs,
+        native_cache=native_cache,
+        native_indices=native_indices.contiguous(),
+        native_storage=native_storage,
+        mask=mask,
+        sink=sink,
+        sm_scale=base_case.sm_scale,
+    )
+
+
+def make_remnant_reference_case(case: RemnantCase) -> tuple["TestParam", "TestcaseForDecode"]:
+    """Expose the same Native tensors through the upstream Torch reference."""
+    batch = case.q.shape[0]
+    num_heads = case.q.shape[2]
+    params = TestParam(
+        s_q=1,
+        s_kv=REMNANT_PAGE_SIZE,
+        topk=REMNANT_PAGE_SIZE,
+        h_q=num_heads,
+        h_kv=1,
+        d_qk=REMNANT_HEAD_DIM,
+        d_v=REMNANT_HEAD_DIM,
+        have_attn_sink=True,
+        decode=ExtraTestParamForDecode(
+            b=batch,
+            is_varlen=False,
+            have_zero_seqlen_k=False,
+            extra_s_k=case.native_cache.shape[0] * REMNANT_PAGE_SIZE,
+            extra_topk=case.packed_indices.shape[-1],
+            block_size=REMNANT_PAGE_SIZE,
+            extra_block_size=REMNANT_PAGE_SIZE,
+            have_extra_topk_length=False,
+        ),
+    )
+
+    swa_quantized = case.swa_cache.view(torch.float8_e4m3fn)
+    native_quantized = case.native_cache.view(torch.float8_e4m3fn)
+    swa_blocked = quant.dequantize_k_cache(
+        swa_quantized, quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+    )
+    native_blocked = quant.dequantize_k_cache(
+        native_quantized, quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+    )
+    dummy_table = torch.zeros((batch, 1), dtype=torch.int32, device=case.q.device)
+    dummy_lengths = torch.full(
+        (batch,), REMNANT_PAGE_SIZE, dtype=torch.int32, device=case.q.device
+    )
+    reference_extra_indices = case.native_indices.clone()
+    positions = torch.arange(
+        case.native_indices.shape[-1], device=case.q.device
+    ).view(1, 1, -1)
+    reference_extra_indices[positions >= case.extra_length.view(batch, 1, 1)] = -1
+    swa_scope = KVScope(
+        params,
+        dummy_lengths,
+        dummy_table,
+        swa_blocked,
+        case.swa_indices,
+        case.swa_indices,
+        None,
+    )
+    extra_scope = KVScope(
+        params,
+        dummy_lengths,
+        dummy_table,
+        native_blocked,
+        reference_extra_indices,
+        reference_extra_indices,
+        None,
+    )
+    return params, TestcaseForDecode(
+        params, case.q, case.sink, case.sm_scale, swa_scope, extra_scope
+    )
+
 
 class TestTarget(enum.Enum):
     FWD = 0

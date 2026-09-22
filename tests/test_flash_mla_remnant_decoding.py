@@ -3,6 +3,7 @@
 Author: Winston Cai.
 """
 
+import dataclasses
 import importlib.util
 
 import pytest
@@ -13,7 +14,12 @@ try:
 except ImportError:
     flash_mla = None
 
-from remnant_fixture import make_case, materialize_native
+from lib import (
+    make_remnant_case,
+    make_remnant_reference_case,
+    materialize_remnant_native,
+)
+import ref
 
 
 pytestmark = pytest.mark.skipif(
@@ -22,6 +28,23 @@ pytestmark = pytest.mark.skipif(
     or importlib.util.find_spec("flash_mla.cuda") is None,
     reason="An H100 and the compiled FlashMLA extension are required",
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class RemnantTestParam:
+    num_heads: int
+    batch: int
+    topk_length: int
+    unique_selections: bool = False
+
+
+def gen_testcase() -> list[RemnantTestParam]:
+    return [
+        RemnantTestParam(num_heads, batch, topk_length)
+        for num_heads in (64, 128)
+        for batch in (8, 16)
+        for topk_length in (512, 317)
+    ]
 
 
 def _run_native(case):
@@ -64,11 +87,13 @@ def _run_remnant(case):
     )
 
 
-@pytest.mark.parametrize("num_heads", [64, 128])
-@pytest.mark.parametrize("batch", [8, 16])
-@pytest.mark.parametrize("topk_length", [512, 317])
-def test_direct_decode_matches_native_adapter(num_heads: int, batch: int, topk_length: int):
-    case = make_case(num_heads, topk_length, batch=batch)
+@pytest.mark.parametrize(
+    "params",
+    gen_testcase(),
+    ids=lambda params: f"H{params.num_heads}-B{params.batch}-K{params.topk_length}",
+)
+def test_direct_decode_matches_native(params: RemnantTestParam):
+    case = make_remnant_case(params.num_heads, params.topk_length, batch=params.batch)
     # The public [page, token, 1, 584] view has a synthetic row width; the
     # decoder addresses the physical 576-byte data rows plus the page scale
     # tail. Inspect the backing page bytes for the native-code check.
@@ -87,11 +112,21 @@ def test_direct_decode_matches_native_adapter(num_heads: int, batch: int, topk_l
     assert torch.isfinite(direct_lse).all(), "Direct Remnant LSE is non-finite"
     torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
     torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
+    reference_params, reference_case = make_remnant_reference_case(case)
+    reference_out, reference_lse = ref.ref_sparse_attn_decode(
+        reference_params, reference_case
+    )
+    torch.testing.assert_close(
+        native_out, reference_out, atol=2.0e-2, rtol=2.0e-2
+    )
+    torch.testing.assert_close(
+        native_lse, reference_lse, atol=2.0e-2, rtol=2.0e-2
+    )
 
 
-@pytest.mark.parametrize("num_heads", [64, 128])
+@pytest.mark.parametrize("num_heads", [64, 128], ids=lambda heads: f"H{heads}")
 def test_direct_decode_mixed_lengths_and_poisoned_padding(num_heads: int):
-    case = make_case(num_heads, 512, batch=8)
+    case = make_remnant_case(num_heads, 512, batch=8)
     lengths = torch.tensor([0, 1, 63, 64, 65, 317, 511, 512], device="cuda", dtype=torch.int32)
     case.extra_length.copy_(lengths)
     # Native was materialized before poisoning. Both paths must ignore every
@@ -105,10 +140,10 @@ def test_direct_decode_mixed_lengths_and_poisoned_padding(num_heads: int):
     torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
 
 
-@pytest.mark.parametrize("num_heads", [64, 128])
-@pytest.mark.parametrize("batch", [8, 16])
+@pytest.mark.parametrize("num_heads", [64, 128], ids=lambda heads: f"H{heads}")
+@pytest.mark.parametrize("batch", [8, 16], ids=lambda batch: f"B{batch}")
 def test_direct_decode_cuda_graph_replay(num_heads: int, batch: int):
-    case = make_case(num_heads, 512, batch=batch)
+    case = make_remnant_case(num_heads, 512, batch=batch)
     meta = flash_mla.get_mla_metadata()[0]
     for _ in range(3):
         _run_remnant(case)
@@ -143,7 +178,7 @@ def test_direct_decode_cuda_graph_replay(num_heads: int, batch: int):
     case.packed_indices.copy_(case.packed_indices.roll(1, dims=-1))
     case.raw_indices.copy_(case.raw_indices.roll(1, dims=-1))
     case.extra_length.sub_(13)
-    materialize_native(case)
+    materialize_remnant_native(case)
     graph.replay()
     torch.cuda.synchronize()
     second = tuple(value.clone() for value in captured)

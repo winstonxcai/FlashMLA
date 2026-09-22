@@ -56,9 +56,10 @@ def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
-
 this_dir = os.path.dirname(os.path.abspath(__file__))
+cutlass_header = Path(this_dir) / "csrc" / "cutlass" / "include" / "cutlass" / "bfloat16.h"
+if not cutlass_header.is_file():
+    raise RuntimeError("CUTLASS is missing; initialize the local csrc/cutlass submodule")
 
 if IS_WINDOWS:
     cxx_args = ["/O2", "/std:c++20", "/DNDEBUG", "/W0"]
@@ -92,22 +93,20 @@ flashmla_sources = [
             "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
             "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
 
-            # sm100 dense prefill & backward
-            "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-            "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-
-            # sm100 sparse prefill
-            "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
-            "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
-            "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-            "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
-
-            # sm100 sparse decode
-            "csrc/sm100/decode/head64/instantiations/v32.cu",
-            "csrc/sm100/decode/head64/instantiations/model1.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
 ]
+if not is_flag_set("FLASH_MLA_DISABLE_SM100"):
+    flashmla_sources.extend([
+        "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+        "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+        "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
+        "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
+        "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+        "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
+        "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+        "csrc/sm100/decode/head64/instantiations/v32.cu",
+        "csrc/sm100/decode/head64/instantiations/model1.cu",
+        "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+    ])
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
