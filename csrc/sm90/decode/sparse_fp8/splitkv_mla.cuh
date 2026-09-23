@@ -26,18 +26,21 @@ using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using fp8_e8m0 = __nv_fp8_e8m0;
 
-// Four-bit lookup table for the ranks inside a nibble, ordered from the
-// bitmap's most-significant bit to its least-significant bit. Combining two
-// nibbles reduces the rank work for each logical 8-value fragment to one
-// popcount and two constant-cache reads.
-static __device__ __constant__ uint16_t kRemnantNibbleRanks[16] = {
-    0x0000, 0x0000, 0x1000, 0x1000, 0x1100, 0x1100, 0x2100, 0x2100,
-    0x1110, 0x1110, 0x2110, 0x2110, 0x2210, 0x2210, 0x3210, 0x3210,
-};
+// Return the exclusive prefix ranks for a four-bit bitmap nibble.  The input
+// is ordered from the bitmap's most-significant bit to its least-significant
+// bit; the result stores one four-bit rank per nibble, e.g. 0xf -> 0x3210.
+// The masked terms are deliberately arithmetic rather than a constant-memory
+// lookup: this keeps the hot rank calculation branch-free and avoids a table
+// read for every reconstructed fragment.
+__device__ __forceinline__ uint32_t remnant_nibble_rank_pack(uint32_t nibble) {
+    return ((nibble & 0x8u) * 0x222u)
+        + ((nibble & 0x4u) * 0x440u)
+        + ((nibble & 0x2u) * 0x800u);
+}
 
 __device__ __forceinline__ uint32_t remnant_byte_rank_pack(uint8_t bits) {
-    const uint32_t high = kRemnantNibbleRanks[bits >> 4];
-    const uint32_t low = kRemnantNibbleRanks[bits & 0xf];
+    const uint32_t high = remnant_nibble_rank_pack(bits >> 4);
+    const uint32_t low = remnant_nibble_rank_pack(bits & 0xf);
     return (high << 16) | (low + __popc(bits >> 4) * 0x1111u);
 }
 
