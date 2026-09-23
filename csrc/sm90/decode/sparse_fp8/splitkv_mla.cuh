@@ -10,6 +10,7 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/cluster_launch.hpp>
+#include <cute/arch/copy_sm80.hpp>
 
 #include <kerutils/kerutils.cuh>
 
@@ -80,31 +81,38 @@ __device__ __forceinline__ void prepare_remnant_row(
     const int value_group = lane_idx >> 3;
     uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
 
-    // Four threads associated with one token each load a contiguous 64-byte
-    // survivor range. The packed record is therefore read once with 128-bit
-    // transactions before logical-coordinate reconstruction begins.
+    // Each lane asynchronously stages its contiguous 64-byte survivor slice.
+    // The copies overlap the bitmap and scale work below.
+    const uint8_t *gvalues = params.remnant_values
+        + block_index * params.stride_remnant_values_page
+        + row_index * params.stride_remnant_values_row;
     if (valid) {
-        const uint8_t *gvalues = params.remnant_values
-            + block_index * params.stride_remnant_values_page
-            + row_index * params.stride_remnant_values_row;
         for (int offset = 0; offset < 64; offset += 16) {
             const uint8_t *src = gvalues + value_group * 64 + offset;
-            uint4 chunk;
             // The external record is 328 B, so successive rows alternate
-            // between 16-byte alignment and an 8-byte offset.  Keep the
-            // coalesced 128-bit path for aligned rows and use two aligned
-            // 64-bit transactions for the other half rather than issuing a
-            // misaligned uint4 load.
+            // between 16-byte alignment and an 8-byte offset. Use 16-byte
+            // copies for aligned rows and two aligned 8-byte copies otherwise.
             if ((reinterpret_cast<uintptr_t>(src) & 0xf) == 0) {
-                chunk = __ldg(reinterpret_cast<const uint4 *>(src));
+                SM80_CP_ASYNC_CACHEALWAYS<uint4>::copy(
+                    *reinterpret_cast<const uint4 *>(src),
+                    *reinterpret_cast<uint4 *>(values + value_group * 64 + offset)
+                );
             } else {
-                const uint2 lo = __ldg(reinterpret_cast<const uint2 *>(src));
-                const uint2 hi = __ldg(reinterpret_cast<const uint2 *>(src + 8));
-                chunk = uint4{lo.x, lo.y, hi.x, hi.y};
+                SM80_CP_ASYNC_CACHEALWAYS<uint2>::copy(
+                    *reinterpret_cast<const uint2 *>(src),
+                    *reinterpret_cast<uint2 *>(values + value_group * 64 + offset)
+                );
+                SM80_CP_ASYNC_CACHEALWAYS<uint2>::copy(
+                    *reinterpret_cast<const uint2 *>(src + 8),
+                    *reinterpret_cast<uint2 *>(values + value_group * 64 + offset + 8)
+                );
             }
-            *reinterpret_cast<uint4 *>(values + value_group * 64 + offset) = chunk;
         }
     }
+    // Commit an async-copy group from every participating lane. Validity is
+    // lane-varying, so keeping the group boundary warp-uniform avoids divergent
+    // async synchronization while invalid rows still issue no memory copies.
+    cp_async_fence();
 
     // One thread per token loads the bitmap and scale metadata and computes
     // the word prefix counts shared by the four survivor-loading threads.
@@ -127,6 +135,9 @@ __device__ __forceinline__ void prepare_remnant_row(
         }
         *reinterpret_cast<uint4 *>(values + 256) = uint4{0, 0, 0, 0};
     }
+    // Invalid rows may have an empty group; waiting on it is harmless and keeps
+    // the wait instruction converged across the warp.
+    cp_async_wait<0>();
     __syncwarp();
 }
 
