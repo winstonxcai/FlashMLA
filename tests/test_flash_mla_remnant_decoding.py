@@ -87,6 +87,36 @@ def _run_remnant(case):
     )
 
 
+def _install_bitmap_edge_patterns(case):
+    """Install balanced masks that exercise nibble edges and the final rank."""
+    device = case.mask.device
+    coordinate = torch.arange(512, device=device)
+    within_byte = coordinate.remainder(8)
+    patterns = torch.stack(
+        (
+            within_byte < 4,  # full high nibble, empty low nibble
+            within_byte >= 4,  # empty high nibble, full low nibble
+            coordinate.remainder(2) == 0,  # 0xAA
+            coordinate.remainder(2) == 1,  # 0x55
+            (within_byte == 0) | (within_byte == 1) | (within_byte == 6) | (within_byte == 7),  # 0xC3
+            (within_byte == 0) | (within_byte == 2) | (within_byte == 5) | (within_byte == 7),  # 0xA5
+            (coordinate < 255) | (coordinate == 511),  # final survivor at rank 255
+        )
+    )
+    row_pattern = torch.arange(case.mask.shape[0], device=device) % patterns.shape[0]
+    case.mask.copy_(patterns.index_select(0, row_pattern))
+
+    values, bitmaps, scales = case.packed_buffers
+    codes = (torch.arange(256, device=device, dtype=torch.uint8) % 126) + 1
+    values.reshape(-1, 256).copy_(codes.expand(values.numel() // 256, -1))
+    shifts = (1 << (63 - torch.arange(64, device=device))).to(torch.int64)
+    packed_bits = case.mask.reshape(-1, 8, 64).to(torch.int64)
+    packed_bitmap = (packed_bits * shifts.view(1, 1, 64)).sum(-1).view(torch.uint64)
+    bitmaps.copy_(packed_bitmap.reshape_as(bitmaps))
+    scales.fill_(127)
+    materialize_remnant_native(case)
+
+
 @pytest.mark.parametrize(
     "params",
     gen_testcase(),
@@ -138,6 +168,24 @@ def test_direct_decode_mixed_lengths_and_poisoned_padding(num_heads: int):
     direct_out, direct_lse = _run_remnant(case)
     torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
     torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
+
+
+@pytest.mark.parametrize("num_heads", [64, 128], ids=lambda heads: f"H{heads}")
+def test_direct_decode_bitmap_expansion_edge_patterns(num_heads: int):
+    case = make_remnant_case(num_heads, 512, batch=8)
+    _install_bitmap_edge_patterns(case)
+
+    native_out, native_lse = _run_native(case)
+    direct_out, direct_lse = _run_remnant(case)
+    torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
+    torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
+
+    reference_params, reference_case = make_remnant_reference_case(case)
+    reference_out, reference_lse = ref.ref_sparse_attn_decode(
+        reference_params, reference_case
+    )
+    torch.testing.assert_close(direct_out, reference_out, atol=2.0e-2, rtol=2.0e-2)
+    torch.testing.assert_close(direct_lse, reference_lse, atol=2.0e-2, rtol=2.0e-2)
 
 
 @pytest.mark.parametrize("num_heads", [64, 128], ids=lambda heads: f"H{heads}")

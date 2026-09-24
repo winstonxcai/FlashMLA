@@ -38,12 +38,6 @@ __device__ __forceinline__ uint32_t remnant_nibble_rank_pack(uint32_t nibble) {
         + ((nibble & 0x2u) * 0x800u);
 }
 
-__device__ __forceinline__ uint32_t remnant_byte_rank_pack(uint8_t bits) {
-    const uint32_t high = remnant_nibble_rank_pack(bits >> 4);
-    const uint32_t low = remnant_nibble_rank_pack(bits & 0xf);
-    return (high << 16) | (low + __popc(bits >> 4) * 0x1111u);
-}
-
 // Keep the survivor window in named registers.  Indexing a byte through an
 // address-taken uint4 array makes nvcc materialize that array in thread-local
 // memory, adding an LDL/STL pair for every reconstructed fragment.
@@ -64,6 +58,37 @@ __device__ __forceinline__ uint8_t remnant_register_byte(
         default: word = second.w; break;
     }
     return static_cast<uint8_t>(word >> ((byte_index & 3) * 8));
+}
+
+// Expand four logical coordinates from the staged survivor stream. A nonempty
+// four-bit fragment spans at most four survivor bytes. Two aligned 32-bit
+// shared loads therefore cover every starting-rank alignment; __byte_perm
+// gathers the four ranks into the native little-endian FP8 byte order.
+__device__ __forceinline__ uint32_t remnant_expand_fp8x4(
+    const uint8_t *values,
+    int rank_base,
+    uint32_t keep_nibble
+) {
+    keep_nibble &= 0xfu;
+    if (keep_nibble == 0) return 0;
+
+    const uint32_t rank_pack = remnant_nibble_rank_pack(keep_nibble);
+    const int aligned_rank = rank_base & ~3;
+    const uint32_t *aligned_values =
+        reinterpret_cast<const uint32_t *>(values + aligned_rank);
+    const uint32_t first = aligned_values[0];
+    const uint32_t second = aligned_values[1];
+    uint32_t selector = 0;
+    uint32_t output_mask = 0;
+    CUTE_UNROLL
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t kept = (keep_nibble >> (3 - i)) & 1u;
+        const int rank = rank_base + ((rank_pack >> (4 * i)) & 0xfu);
+        const uint32_t source_byte = static_cast<uint32_t>(rank - aligned_rank);
+        selector |= source_byte << (4 * i);
+        output_mask |= (0u - kept & 0xffu) << (8 * i);
+    }
+    return __byte_perm(first, second, selector) & output_mask;
 }
 
 template <typename Plan>
@@ -139,8 +164,6 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     bool valid
 ) {
     fp8x8 result;
-    uint32_t lo = 0;
-    uint32_t hi = 0;
     const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
     const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
     const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
@@ -154,24 +177,12 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
         ? 0ULL
         : (~0ULL << (64 - byte_in_word * 8));
     const int rank_base = prefix[word] + __popcll(keep & prior_mask);
-    const uint32_t rank_pack = remnant_byte_rank_pack(byte_mask);
-    // A fragment can begin at any survivor rank modulo 16.  Eight logical
-    // coordinates can therefore span 24 bytes, so a single 16-byte window is
-    // not sufficient.  The staged row has 16 bytes of zero padding, making
-    // this bounded 32-byte read safe even for the final fragment.
-    CUTE_UNROLL
-    for (int i = 0; i < 8; ++i) {
-        const int bit = dim_base + i;
-        const int lane = bit & 63;
-        const bool kept = ((keep >> (63 - lane)) & 1ULL) != 0;
-        const int rank_shift = i < 4 ? 16 + 4 * i : 4 * (i - 4);
-        const int rank = rank_base + ((rank_pack >> rank_shift) & 0xf);
-        const uint8_t code = valid && kept ? values[rank] : 0;
-        if (i < 4)
-            reinterpret_cast<uint8_t*>(&lo)[i] = code;
-        else
-            reinterpret_cast<uint8_t*>(&hi)[i - 4] = code;
-    }
+    const uint32_t first_nibble = byte_mask >> 4;
+    const uint32_t second_nibble = byte_mask & 0xfu;
+    const uint32_t lo = remnant_expand_fp8x4(values, rank_base, first_nibble);
+    const uint32_t hi = remnant_expand_fp8x4(
+        values, rank_base + __popc(first_nibble), second_nibble
+    );
     *reinterpret_cast<uint32_t*>(&result.lo) = lo;
     *reinterpret_cast<uint32_t*>(&result.hi) = hi;
     return result;
@@ -186,10 +197,6 @@ __device__ __forceinline__ fp8x16 load_remnant_fp8x16(
     bool valid
 ) {
     fp8x16 result;
-    uint32_t output0 = 0;
-    uint32_t output1 = 0;
-    uint32_t output2 = 0;
-    uint32_t output3 = 0;
     const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
     const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
     const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
@@ -206,32 +213,25 @@ __device__ __forceinline__ fp8x16 load_remnant_fp8x16(
         ? 0ULL
         : (~0ULL << (64 - byte_in_word * 8));
     const int rank_base = prefix[word] + __popcll(keep & prior_mask);
-    const uint32_t first_rank_pack = remnant_byte_rank_pack(first_mask);
-    const uint32_t second_rank_pack = remnant_byte_rank_pack(second_mask);
+    const uint32_t first_high_nibble = first_mask >> 4;
+    const uint32_t first_low_nibble = first_mask & 0xfu;
+    const uint32_t second_high_nibble = second_mask >> 4;
+    const uint32_t second_low_nibble = second_mask & 0xfu;
+    const uint32_t output0 = remnant_expand_fp8x4(
+        values, rank_base, first_high_nibble
+    );
+    const uint32_t output1 = remnant_expand_fp8x4(
+        values, rank_base + __popc(first_high_nibble), first_low_nibble
+    );
     const int second_rank_base = rank_base + __popc(first_mask);
-    CUTE_UNROLL
-    for (int i = 0; i < 16; ++i) {
-        const bool in_first_byte = i < 8;
-        const int bit_in_byte = i & 7;
-        const uint8_t byte_mask = in_first_byte ? first_mask : second_mask;
-        const uint32_t rank_pack = in_first_byte ? first_rank_pack : second_rank_pack;
-        const int rank_shift = bit_in_byte < 4
-            ? 16 + 4 * bit_in_byte
-            : 4 * (bit_in_byte - 4);
-        const int rank = (in_first_byte ? rank_base : second_rank_base)
-            + ((rank_pack >> rank_shift) & 0xf);
-        const bool kept = ((byte_mask >> (7 - bit_in_byte)) & 1u) != 0;
-        const uint8_t code = valid && kept ? values[rank] : 0;
-        const uint32_t packed_code = static_cast<uint32_t>(code) << ((i & 3) * 8);
-        if (i < 4)
-            output0 |= packed_code;
-        else if (i < 8)
-            output1 |= packed_code;
-        else if (i < 12)
-            output2 |= packed_code;
-        else
-            output3 |= packed_code;
-    }
+    const uint32_t output2 = remnant_expand_fp8x4(
+        values, second_rank_base, second_high_nibble
+    );
+    const uint32_t output3 = remnant_expand_fp8x4(
+        values,
+        second_rank_base + __popc(second_high_nibble),
+        second_low_nibble
+    );
     *reinterpret_cast<uint32_t *>(&result.lo.lo) = output0;
     *reinterpret_cast<uint32_t *>(&result.lo.hi) = output1;
     *reinterpret_cast<uint32_t *>(&result.hi.lo) = output2;
