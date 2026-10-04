@@ -38,6 +38,52 @@ __device__ __forceinline__ uint32_t remnant_nibble_rank_pack(uint32_t nibble) {
         + ((nibble & 0x2u) * 0x800u);
 }
 
+__device__ __forceinline__ uint32_t remnant_byte_rank_pack(uint8_t bits) {
+    const uint32_t high = remnant_nibble_rank_pack(bits >> 4);
+    const uint32_t low = remnant_nibble_rank_pack(bits & 0xf);
+    return (high << 16) | (low + __popc(bits >> 4) * 0x1111u);
+}
+
+// Select four logical coordinates from an already aligned survivor span.
+__device__ __forceinline__ uint32_t remnant_window_fp8x4(
+    uint32_t first, uint32_t second, uint32_t selector, uint32_t keep
+) {
+    const uint32_t gathered = __byte_perm(first, second, selector);
+    const uint32_t sign_bits = (keep * 0x80402010u) & 0x80808080u;
+    uint32_t output_mask;
+    asm("prmt.b32 %0, %1, %2, 0xba98;" : "=r"(output_mask) : "r"(sign_bits), "r"(0u));
+    return gathered & output_mask;
+}
+
+__device__ __forceinline__ uint2 remnant_window_fp8x8(
+    const uint8_t *values, int rank_base, uint8_t mask
+) {
+#ifdef E009_H64_BRANCHLESS_WINDOW
+    // Empty fragments read the initialized 16-byte row pad; output masking
+    // still zeros every coordinate. Nonempty fragments retain their addresses.
+    rank_base = mask == 0 ? 256 : rank_base;
+#else
+    if (mask == 0) return uint2{0, 0};
+#endif
+    const uint2 *window = reinterpret_cast<const uint2 *>(values + (rank_base & ~7));
+    const uint2 first = window[0];
+    const uint2 second = window[1];
+    // Align the first eight survivors once, rather than selecting between the
+    // two eight-byte halves separately for every reconstructed output word.
+    const bool upper_word = (rank_base & 4) != 0;
+    const uint32_t word0 = upper_word ? first.y : first.x;
+    const uint32_t word1 = upper_word ? second.x : first.y;
+    const uint32_t word2 = upper_word ? second.y : second.x;
+    const uint32_t shift = (rank_base & 3) * 8;
+    const uint32_t low = __funnelshift_r(word0, word1, shift);
+    const uint32_t high = __funnelshift_r(word1, word2, shift);
+    const uint32_t selectors = remnant_byte_rank_pack(mask);
+    return uint2{
+        remnant_window_fp8x4(low, high, selectors >> 16, mask >> 4),
+        remnant_window_fp8x4(low, high, selectors & 0xffffu, mask & 0xfu),
+    };
+}
+
 // Keep the survivor window in named registers.  Indexing a byte through an
 // address-taken uint4 array makes nvcc materialize that array in thread-local
 // memory, adding an LDL/STL pair for every reconstructed fragment.
@@ -58,37 +104,6 @@ __device__ __forceinline__ uint8_t remnant_register_byte(
         default: word = second.w; break;
     }
     return static_cast<uint8_t>(word >> ((byte_index & 3) * 8));
-}
-
-// Expand four logical coordinates from the staged survivor stream. A nonempty
-// four-bit fragment spans at most four survivor bytes. Two aligned 32-bit
-// shared loads therefore cover every starting-rank alignment; __byte_perm
-// gathers the four ranks into the native little-endian FP8 byte order.
-__device__ __forceinline__ uint32_t remnant_expand_fp8x4(
-    const uint8_t *values,
-    int rank_base,
-    uint32_t keep_nibble
-) {
-    keep_nibble &= 0xfu;
-    if (keep_nibble == 0) return 0;
-
-    const uint32_t rank_pack = remnant_nibble_rank_pack(keep_nibble);
-    const int aligned_rank = rank_base & ~3;
-    const uint32_t *aligned_values =
-        reinterpret_cast<const uint32_t *>(values + aligned_rank);
-    const uint32_t first = aligned_values[0];
-    const uint32_t second = aligned_values[1];
-    uint32_t selector = 0;
-    uint32_t output_mask = 0;
-    CUTE_UNROLL
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t kept = (keep_nibble >> (3 - i)) & 1u;
-        const int rank = rank_base + ((rank_pack >> (4 * i)) & 0xfu);
-        const uint32_t source_byte = static_cast<uint32_t>(rank - aligned_rank);
-        selector |= source_byte << (4 * i);
-        output_mask |= (0u - kept & 0xffu) << (8 * i);
-    }
-    return __byte_perm(first, second, selector) & output_mask;
 }
 
 template <typename Plan>
@@ -134,8 +149,12 @@ __device__ __forceinline__ void prepare_remnant_row(
     // One thread per token loads the bitmap and scale metadata and computes
     // the word prefix counts shared by the four survivor-loading threads.
     if (value_group == 0) {
+#ifdef E009_H64_BITMAP_TRANSPOSE
+        uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot;
+#else
         uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
-        uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
+#endif
+        uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * Plan::PREFIX_STRIDE;
         uint8_t *scales = plan.remnant.scales[buf_idx] + row_slot * 8;
         const uint64_t *gbitmap = params.remnant_bitmaps
             + block_index * params.stride_remnant_bitmaps_page
@@ -144,11 +163,23 @@ __device__ __forceinline__ void prepare_remnant_row(
             + block_index * params.stride_remnant_scales_page
             + row_index * params.stride_remnant_scales_row;
         prefix[0] = 0;
+#ifdef E009_H64_REGISTER_PREFIX
+        int prefix_count = 0;
+#endif
         for (int word = 0; word < 8; ++word) {
             uint64_t bits = valid ? __ldg(gbitmap + word) : 0ULL;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+            bitmap[word * 32] = bits;
+#else
             bitmap[word] = bits;
+#endif
             scales[word] = valid ? __ldg(gscales + word) : 0;
+#ifdef E009_H64_REGISTER_PREFIX
+            prefix_count += __popcll(bits);
+            prefix[word + 1] = prefix_count;
+#else
             prefix[word + 1] = prefix[word] + __popcll(bits);
+#endif
         }
         *reinterpret_cast<uint4 *>(values + 256) = uint4{0, 0, 0, 0};
     }
@@ -164,11 +195,19 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
     bool valid
 ) {
     fp8x8 result;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot;
+#else
     const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
-    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
+#endif
+    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * Plan::PREFIX_STRIDE;
     const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
     const int word = dim_base / 64;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+    const uint64_t keep = valid ? bitmap[word * 32] : 0;
+#else
     const uint64_t keep = valid ? bitmap[word] : 0;
+#endif
     const int byte_in_word = (dim_base & 63) >> 3;
     const uint8_t byte_mask = static_cast<uint8_t>(
         (keep >> (56 - byte_in_word * 8)) & 0xffu
@@ -177,14 +216,9 @@ __device__ __forceinline__ fp8x8 load_remnant_fp8x8(
         ? 0ULL
         : (~0ULL << (64 - byte_in_word * 8));
     const int rank_base = prefix[word] + __popcll(keep & prior_mask);
-    const uint32_t first_nibble = byte_mask >> 4;
-    const uint32_t second_nibble = byte_mask & 0xfu;
-    const uint32_t lo = remnant_expand_fp8x4(values, rank_base, first_nibble);
-    const uint32_t hi = remnant_expand_fp8x4(
-        values, rank_base + __popc(first_nibble), second_nibble
-    );
-    *reinterpret_cast<uint32_t*>(&result.lo) = lo;
-    *reinterpret_cast<uint32_t*>(&result.hi) = hi;
+    const uint2 expanded = remnant_window_fp8x8(values, rank_base, byte_mask);
+    *reinterpret_cast<uint32_t *>(&result.lo) = expanded.x;
+    *reinterpret_cast<uint32_t *>(&result.hi) = expanded.y;
     return result;
 }
 
@@ -197,11 +231,19 @@ __device__ __forceinline__ fp8x16 load_remnant_fp8x16(
     bool valid
 ) {
     fp8x16 result;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot;
+#else
     const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
-    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * 9;
+#endif
+    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * Plan::PREFIX_STRIDE;
     const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
     const int word = dim_base / 64;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+    const uint64_t keep = valid ? bitmap[word * 32] : 0;
+#else
     const uint64_t keep = valid ? bitmap[word] : 0;
+#endif
     const int byte_in_word = (dim_base & 63) >> 3;
     const uint8_t first_mask = static_cast<uint8_t>(
         (keep >> (56 - byte_in_word * 8)) & 0xffu
@@ -213,29 +255,12 @@ __device__ __forceinline__ fp8x16 load_remnant_fp8x16(
         ? 0ULL
         : (~0ULL << (64 - byte_in_word * 8));
     const int rank_base = prefix[word] + __popcll(keep & prior_mask);
-    const uint32_t first_high_nibble = first_mask >> 4;
-    const uint32_t first_low_nibble = first_mask & 0xfu;
-    const uint32_t second_high_nibble = second_mask >> 4;
-    const uint32_t second_low_nibble = second_mask & 0xfu;
-    const uint32_t output0 = remnant_expand_fp8x4(
-        values, rank_base, first_high_nibble
-    );
-    const uint32_t output1 = remnant_expand_fp8x4(
-        values, rank_base + __popc(first_high_nibble), first_low_nibble
-    );
-    const int second_rank_base = rank_base + __popc(first_mask);
-    const uint32_t output2 = remnant_expand_fp8x4(
-        values, second_rank_base, second_high_nibble
-    );
-    const uint32_t output3 = remnant_expand_fp8x4(
-        values,
-        second_rank_base + __popc(second_high_nibble),
-        second_low_nibble
-    );
-    *reinterpret_cast<uint32_t *>(&result.lo.lo) = output0;
-    *reinterpret_cast<uint32_t *>(&result.lo.hi) = output1;
-    *reinterpret_cast<uint32_t *>(&result.hi.lo) = output2;
-    *reinterpret_cast<uint32_t *>(&result.hi.hi) = output3;
+    const uint2 first = remnant_window_fp8x8(values, rank_base, first_mask);
+    const uint2 second = remnant_window_fp8x8(values, rank_base + __popc(first_mask), second_mask);
+    *reinterpret_cast<uint32_t *>(&result.lo.lo) = first.x;
+    *reinterpret_cast<uint32_t *>(&result.lo.hi) = first.y;
+    *reinterpret_cast<uint32_t *>(&result.hi.lo) = second.x;
+    *reinterpret_cast<uint32_t *>(&result.hi.hi) = second.y;
     return result;
 }
 
@@ -249,7 +274,11 @@ __device__ __forceinline__ bf16 remnant_scale(
 ) {
     const uint8_t *scales = plan.remnant.scales[buf_idx] + row_slot * 8;
     const int code = valid ? static_cast<int>(scales[word]) : 0;
+#ifdef E009_H64_BITCAST_SCALE
+    return bf16::bitcast(static_cast<uint16_t>(code << 7));
+#else
     return (bf16)__int_as_float(code << 23);
+#endif
 }
 
 template<
@@ -449,11 +478,47 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                 Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
                 Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutHalfV{});
 
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                // Optional debug timing is taken by one elected WG0 lane. This
+                // is that lane's elapsed SM-clock interval, not summed warp time.
+                const bool record_ready_wait =
+                    params.ready_wait_cycles != nullptr && idx_in_warpgroup == 0;
+                unsigned long long local_wait_start = 0;
+                unsigned long long local_wait_end = 0;
+                unsigned long long remote_wait_start = 0;
+                unsigned long long remote_wait_end = 0;
+#endif
+
                 // Wait, issue WGMMA
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                if (record_ready_wait) local_wait_start = clock64();
+#endif
                 plan.bar_k_local_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                if (record_ready_wait) local_wait_end = clock64();
+#endif
                 if constexpr (CLUSTER_SIZE == 2) {
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                    if (record_ready_wait) remote_wait_start = clock64();
+#endif
                     plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                    if (record_ready_wait) remote_wait_end = clock64();
+#endif
                 }
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                if (record_ready_wait) {
+                    const int ready_wait_blocks =
+                        (params.topk + TOPK_BLOCK_SIZE - 1) / TOPK_BLOCK_SIZE +
+                        (params.extra_topk + TOPK_BLOCK_SIZE - 1) / TOPK_BLOCK_SIZE;
+                    const size_t record =
+                        (((static_cast<size_t>(partition_idx) * params.s_q + s_q_idx) *
+                          NUM_M_BLOCKS + head_block_idx) * ready_wait_blocks + block_idx) * 3;
+                    params.ready_wait_cycles[record] = local_wait_end - local_wait_start;
+                    params.ready_wait_cycles[record + 1] = remote_wait_end - remote_wait_start;
+                    params.ready_wait_cycles[record + 2] = block_idx - args.start_block_idx;
+                }
+#endif
 
                 gemm<true, -1>(
                     tiled_mma_QK,
@@ -684,8 +749,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
         cutlass::arch::warpgroup_reg_dealloc<152>();
 
         static_assert(CLUSTER_SIZE == 1 || CLUSTER_SIZE == 2);
-        static constexpr int NUM_TOKENS_PER_THREAD = CLUSTER_SIZE == 1 ? 2 : 1;
-        static constexpr int NUM_TOKENS_PER_ROUND = 32; // If head is 128, each CTA is responsible for dequantizing 32 tokens (1 rounds); if head is 64, each CTA is responsible for dequantizing 64 tokens (2 rounds)
+        static constexpr int NUM_TOKENS_PER_THREAD = TOPK_BLOCK_SIZE / CLUSTER_SIZE / 32;
+        static_assert(NUM_TOKENS_PER_THREAD >= 1);
+        static constexpr int NUM_TOKENS_PER_ROUND = 32; // H64 uses one or two rounds according to tile width; H128 uses one.
         int warp_idx = __shfl_sync(0xffffffff, idx_in_warpgroup / 32, 0);
         int lane_idx = idx_in_warpgroup % 32;
         int my_token_idx_base = warp_idx*8 + lane_idx%8;
@@ -782,7 +848,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
                     const bool remnant_valid = token_index != -1 && raw_token_index >= 0;
-                    const int remnant_row_slot = my_token_idx % (TOPK_BLOCK_SIZE / 2);
+                    const int remnant_row_slot = my_token_idx % REMNANT_ROWS;
 
                     fp8* gK_base = nullptr;
                     bf16 scales[NUM_SCALES];
@@ -874,15 +940,32 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                                 (float)cur.a67.x, (float)cur.a67.y,
                             };
                             if (valid) {
-                                for (int pair = 0; pair < 4; ++pair) {
-                                    const int freq = raw_token_index * 4 * 32 + dim_idx * 16 + (rope_base_dim + pair * 2) / 2;
-                                    const float c = __ldg(params.remnant_freqs + freq * 2);
-                                    const float s = __ldg(params.remnant_freqs + freq * 2 + 1);
+                                const int first_pair = raw_token_index * 4 * 32
+                                    + dim_idx * 16 + rope_base_dim / 2;
+                                const float *frequency = params.remnant_freqs + first_pair * 2;
+                                float4 first, second;
+                                // Four contiguous cosine/sine values per load.
+                                // Preserve support for contiguous frequency views
+                                // whose storage offset is not 16-byte aligned.
+                                if ((reinterpret_cast<uintptr_t>(frequency) & 15) == 0) {
+                                    first = __ldg(reinterpret_cast<const float4 *>(frequency));
+                                    second = __ldg(reinterpret_cast<const float4 *>(frequency + 4));
+                                } else {
+                                    first = float4{__ldg(frequency), __ldg(frequency + 1),
+                                                   __ldg(frequency + 2), __ldg(frequency + 3)};
+                                    second = float4{__ldg(frequency + 4), __ldg(frequency + 5),
+                                                    __ldg(frequency + 6), __ldg(frequency + 7)};
+                                }
+                                auto rotate_pair = [&](int pair, float c, float s) {
                                     const float x0 = values[pair * 2];
                                     const float x1 = values[pair * 2 + 1];
                                     values[pair * 2] = x0 * c - x1 * s;
                                     values[pair * 2 + 1] = x0 * s + x1 * c;
-                                }
+                                };
+                                rotate_pair(0, first.x, first.y);
+                                rotate_pair(1, first.z, first.w);
+                                rotate_pair(2, second.x, second.y);
+                                rotate_pair(3, second.z, second.w);
                             } else {
                                 for (int i = 0; i < 8; ++i)
                                     values[i] = 0.0f;
@@ -947,7 +1030,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
 
                 fence_view_async_shared();
 
-                if (idx_in_warpgroup < 32) {
+                if (idx_in_warpgroup < TOPK_BLOCK_SIZE / 2) {
                     // We put this after fence_view_async_shared() since this won't be read by async proxy
                     auto is_index_valid = [&](int index, int offset_within_thread) -> bool {
                         if constexpr (MODEL_TYPE == ModelType::V32) {

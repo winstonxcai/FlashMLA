@@ -218,6 +218,7 @@ def make_remnant_case(
         h_kv=1,
         d_qk=REMNANT_HEAD_DIM,
         d_v=REMNANT_HEAD_DIM,
+        seed=20260919,
         decode=ExtraTestParamForDecode(
             b=batch,
             is_varlen=False,
@@ -226,11 +227,14 @@ def make_remnant_case(
         ),
     )
     previous_default_device = torch.get_default_device()
+    previous_default_dtype = torch.get_default_dtype()
     torch.set_default_device(device)
+    torch.set_default_dtype(torch.bfloat16)
     try:
         base_case = generate_testcase_for_decode(base_params)
     finally:
         torch.set_default_device(previous_default_device)
+        torch.set_default_dtype(previous_default_dtype)
 
     rows_per_request = 512 if unique_selections else REMNANT_PAGE_SIZE
     rows = max(REMNANT_PAGE_SIZE, batch * rows_per_request)

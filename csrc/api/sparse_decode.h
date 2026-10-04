@@ -95,8 +95,8 @@ public:
         Arch arch = Arch();
         return {
             std::max(arch.num_sms / s_q / (h_q / 64), 1),
-            5,
-            64
+            1,  // Packed decode has a smaller per-request setup estimate.
+            h_q == 64 ? 32 : 64
         };
     }
 
@@ -236,6 +236,9 @@ sparse_attn_decode_interface_impl(
     const std::optional<at::Tensor> &remnant_scales,
     const std::optional<at::Tensor> &remnant_raw_indices,
     const std::optional<at::Tensor> &remnant_freqs
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+    , std::optional<at::Tensor> *ready_wait_cycles_out = nullptr
+#endif
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -475,6 +478,18 @@ sparse_attn_decode_interface_impl(
 
     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
 
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+    if (ready_wait_cycles_out != nullptr) {
+        TORCH_CHECK(!REMNANT, "ready-wait cycle capture is native-only");
+        TORCH_CHECK(arch.is_sm90a() && d_qk == 512 && d_v == 512 && h_q == 128,
+                    "ready-wait cycle capture requires native SM90 H128 D512");
+        const int ready_wait_blocks = (topk + 63) / 64 + (extra_topk + 63) / 64;
+        *ready_wait_cycles_out = torch::full(
+            {impl_meta.num_sm_parts, s_q, h_q / 64, ready_wait_blocks, 3},
+            -1, opts.dtype(at::kLong));
+    }
+#endif
+
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, d_v,
         sm_scale, sm_scale * LOG_2_E,
@@ -565,6 +580,12 @@ sparse_attn_decode_interface_impl(
     params.tile_scheduler_metadata_ptr = (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr();
     params.num_splits_ptr = num_splits->data_ptr<int>();
     params.num_sm_parts = impl_meta.num_sm_parts;
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+    if (ready_wait_cycles_out != nullptr) {
+        params.ready_wait_cycles = reinterpret_cast<unsigned long long*>(
+            ready_wait_cycles_out->value().data_ptr<int64_t>());
+    }
+#endif
 
     // Allocate intermediate buffers for split-KV
     const int total_num_splits = b + impl_meta.num_sm_parts;
@@ -602,6 +623,16 @@ sparse_attn_decode_interface_impl(
         ku::get_optional_tensor_ptr<float>(attn_sink),
         at::cuda::getCurrentCUDAStream().stream()
     };
+    if constexpr (REMNANT) {
+        // Each request split owns at least one KV tile. Index capacities bound
+        // valid per-request lengths, including the scheduler's one-tile minimum
+        // for empty SWA. Tighten only combine's compile-time scratch/reduction
+        // bound; retain the original metadata, strides and FP32 accumulators.
+        const int tile = impl_meta.block_size_topk;
+        const int max_request_tiles = (std::max(topk, 1) + tile - 1) / tile
+            + (extra_topk + tile - 1) / tile;
+        combine_params.num_sm_parts = std::min(params.num_sm_parts, max_request_tiles);
+    }
     smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
 
     delete impl;
@@ -629,6 +660,36 @@ sparse_attn_decode_interface(
         num_splits, extra_kv, extra_indices, extra_topk_length, d_v, sm_scale,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
 }
+
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor>
+sparse_attn_decode_wait_cycles_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    const std::optional<at::Tensor> &extra_kv,
+    const std::optional<at::Tensor> &extra_indices,
+    const std::optional<at::Tensor> &extra_topk_length,
+    int d_v,
+    float sm_scale
+) {
+    TORCH_CHECK(extra_kv.has_value() && extra_indices.has_value() && extra_topk_length.has_value(),
+                "native ready-wait cycle capture requires the dense C4 cache and its indices");
+    std::optional<at::Tensor> wait_cycles;
+    auto result = sparse_attn_decode_interface_impl<false>(
+        q, kv, indices, topk_length, attn_sink, tile_scheduler_metadata,
+        num_splits, extra_kv, extra_indices, extra_topk_length, d_v, sm_scale,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        &wait_cycles);
+    TORCH_CHECK(wait_cycles.has_value(), "native ready-wait cycles were not returned");
+    return {std::get<0>(result), std::get<1>(result), std::get<2>(result),
+            std::get<3>(result), *wait_cycles};
+}
+#endif
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_remnant_interface(

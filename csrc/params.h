@@ -117,6 +117,11 @@ struct SparseAttnDecodeParams {
     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
     int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
     int num_sm_parts;
+
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+    // Native-only debug output; omitted from ordinary performance builds.
+    unsigned long long* __restrict__ ready_wait_cycles; // [partition, s_q, head_block, kv_block, local/remote]
+#endif
 };
 
 struct CombineParams {

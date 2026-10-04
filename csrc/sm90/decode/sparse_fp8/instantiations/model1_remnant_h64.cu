@@ -1,3 +1,7 @@
+#define E009_H64_REGISTER_PREFIX 1
+#define E009_H64_BITMAP_TRANSPOSE 1
+#define E009_H64_BITCAST_SCALE 1
+#define E009_H64_BRANCHLESS_WINDOW 1
 // Authored by Winston Cai.
 
 #include "../splitkv_mla.cuh"

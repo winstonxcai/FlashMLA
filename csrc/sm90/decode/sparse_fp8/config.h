@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <type_traits>
 #include <cutlass/numeric_types.h>
 #include <cutlass/arch/barrier.h>
 #include <cute/tensor.hpp>
@@ -14,14 +15,14 @@ using namespace cute;
 
 namespace sm90::decode::sparse_fp8 {
 
-template <bool ENABLED, int NUM_K_BUFS, int ROWS>
+template <bool ENABLED, int NUM_K_BUFS, int ROWS, int PREFIX_STRIDE = 9>
 struct RemnantScratchStorage {};
 
-template <int NUM_K_BUFS, int ROWS>
-struct RemnantScratchStorage<true, NUM_K_BUFS, ROWS> {
+template <int NUM_K_BUFS, int ROWS, int PREFIX_STRIDE>
+struct RemnantScratchStorage<true, NUM_K_BUFS, ROWS, PREFIX_STRIDE> {
     CUTE_ALIGNAS(16) uint8_t values[NUM_K_BUFS][ROWS * 272];
     CUTE_ALIGNAS(8) uint64_t bitmaps[NUM_K_BUFS][ROWS * 8];
-    uint16_t rank_prefix[NUM_K_BUFS][ROWS * 9];
+    uint16_t rank_prefix[NUM_K_BUFS][ROWS * PREFIX_STRIDE];
     uint8_t scales[NUM_K_BUFS][ROWS * 8];
 };
 
@@ -43,9 +44,11 @@ static constexpr int NUM_SCALES = MODEL_TYPE == ModelType::V32 ? 4 : 8;  // For 
 
 static constexpr int NUM_THREADS = 128*3;
 static constexpr int BLOCK_M = 64;
-static constexpr int TOPK_BLOCK_SIZE = 64;
+// E009 isolated experiment: allow H64 WG0 to consume one 32-token producer round.
+static constexpr int TOPK_BLOCK_SIZE = REMNANT && NUM_HEADS == 64 ? 32 : 64;
 static constexpr int NUM_K_BUFS = 2;
-static constexpr int REMNANT_ROWS = TOPK_BLOCK_SIZE / 2;
+static constexpr int REMNANT_ROWS = 32;
+static constexpr int REMNANT_PREFIX_STRIDE = REMNANT ? 10 : 9;
 
 using SmemLayoutQTile = decltype(tile_to_shape(
     GMMA::Layout_SW128_Atom<bf16, GMMA::Major::K>{},
@@ -98,11 +101,13 @@ using SmemLayoutV = SmemLayoutKTilesTransposed<HEAD_DIM_V/64>;
 using SmemLayoutHalfV = SmemLayoutKTilesTransposed<HEAD_DIM_V/64/2>;
 
 using SmemLayoutS = decltype(tile_to_shape(
-    GMMA::Layout_K_SW128_Atom<bf16>{},
+    std::conditional_t<TOPK_BLOCK_SIZE == 32,
+        GMMA::Layout_K_SW64_Atom<bf16>, GMMA::Layout_K_SW128_Atom<bf16>>{},
     Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}
 ));
 
 struct SharedMemoryPlan {
+    static constexpr int PREFIX_STRIDE = REMNANT_PREFIX_STRIDE;
     array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
     union {
         array_aligned<bf16, cosize_v<SmemLayoutK>> k[NUM_K_BUFS];
@@ -115,7 +120,7 @@ struct SharedMemoryPlan {
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
     // This storage is present only in Remnant instantiations. Native keeps
     // the stock shared-memory footprint and occupancy constraints.
-    RemnantScratchStorage<REMNANT, NUM_K_BUFS, REMNANT_ROWS> remnant;
+    RemnantScratchStorage<REMNANT, NUM_K_BUFS, REMNANT_ROWS, REMNANT_PREFIX_STRIDE> remnant;
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
 };
 
@@ -128,12 +133,16 @@ struct TmaParams {
 };
 
 using TiledMMA_QK = decltype(make_tiled_mma(
-    GMMA::MMA_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{},
+    std::conditional_t<TOPK_BLOCK_SIZE == 32,
+        GMMA::MMA_64x32x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>,
+        GMMA::MMA_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>>{},
     Layout<Shape<_1, _1, _1>>{}
 ));
 
 using TiledMMA_QK_rQ = decltype(make_tiled_mma(
-    GMMA::MMA_64x64x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::K>{},
+    std::conditional_t<TOPK_BLOCK_SIZE == 32,
+        GMMA::MMA_64x32x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::K>,
+        GMMA::MMA_64x64x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::K>>{},
     Layout<Shape<_1, _1, _1>>{}
 ));
 
@@ -168,7 +177,7 @@ static __forceinline__ __device__ void sync_all_threads_in_cluster() {
     }
 }
 
-// Save rPb (64x64, bfloat16) to sP using the stmatrix instruction
+// Save rPb (64 x TOPK_BLOCK_SIZE, bfloat16) using the stmatrix instruction
 template<
     typename Tensor0,
     typename Tensor1
