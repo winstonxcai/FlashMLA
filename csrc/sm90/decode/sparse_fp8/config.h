@@ -168,10 +168,34 @@ enum NamedBarriers : uint32_t {
 };
 
 
+// Diagnostic correction: partial-CTA consumers execute divergent branches.
+// Keep Native/H128 instructions unchanged for the release control.
+template<uint32_t ID>
+static __forceinline__ __device__ void consumer_barrier_sync() {
+    if constexpr (WIDE_PRODUCER) {
+        asm volatile("barrier.sync %0, 256;" :: "n"(ID + static_cast<uint32_t>(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier)) : "memory");
+    } else {
+        cutlass::arch::NamedBarrier::arrive_and_wait(256, ID);
+    }
+}
+template<uint32_t ID>
+static __forceinline__ __device__ void consumer_barrier_arrive() {
+    if constexpr (WIDE_PRODUCER) {
+        asm volatile("barrier.arrive %0, 256;" :: "n"(ID + static_cast<uint32_t>(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier)) : "memory");
+    } else {
+        cutlass::arch::NamedBarrier::arrive(256, ID);
+    }
+}
+
 // Synchronize all threads within the cluster (which processes one q token)
 static __forceinline__ __device__ void sync_all_threads_in_cluster() {
     if constexpr (CLUSTER_SIZE == 1) {
-        __syncthreads();
+        if constexpr (WIDE_PRODUCER) {
+            // Every CTA thread participates, through separate warpgroup paths.
+            asm volatile("barrier.sync 0, 512;" ::: "memory");
+        } else {
+            __syncthreads();
+        }
     } else {
         ku::barrier_cluster_arrive_relaxed();
         ku::barrier_cluster_wait_acquire();
@@ -255,7 +279,7 @@ static __forceinline__ __device__ void store_o(
         }
 
         cutlass::arch::fence_view_async_shared();
-        NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
+        consumer_barrier_sync<NamedBarriers::epilogue_r2s_ready>();
 
         if (threadIdx.x == 0) {
             SM90_TMA_STORE_5D::copy(
@@ -279,7 +303,7 @@ static __forceinline__ __device__ void store_o(
         }
         cutlass::arch::fence_view_async_shared();
         
-        NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
+        consumer_barrier_sync<NamedBarriers::epilogue_r2s_ready>();
         
         if (elect_one_sync()) {
             CUTLASS_PRAGMA_UNROLL
