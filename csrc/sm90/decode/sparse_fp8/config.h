@@ -42,7 +42,8 @@ static constexpr int HEAD_DIM_NOPE = HEAD_DIM_K - HEAD_DIM_ROPE;
 static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 128 : 64;
 static constexpr int NUM_SCALES = MODEL_TYPE == ModelType::V32 ? 4 : 8;  // For MODEL1: 7 fp8_e4m3 + 1 padding
 
-static constexpr int NUM_THREADS = 128*3;
+static constexpr bool WIDE_PRODUCER = REMNANT && NUM_HEADS == 64 && MODEL_TYPE == ModelType::MODEL1;
+static constexpr int NUM_THREADS = WIDE_PRODUCER ? 512 : 128*3;
 static constexpr int BLOCK_M = 64;
 // E009 isolated experiment: allow H64 WG0 to consume one 32-token producer round.
 static constexpr int TOPK_BLOCK_SIZE = REMNANT && NUM_HEADS == 64 ? 32 : 64;
@@ -147,12 +148,12 @@ using TiledMMA_QK_rQ = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_PV_LocalP = decltype(make_tiled_mma(
-    GMMA::MMA_64x256x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>{},
+    std::conditional_t<WIDE_PRODUCER, GMMA::MMA_64x128x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>, GMMA::MMA_64x256x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>>{},
     Layout<Shape<_1, _1, _1>>{}
 ));
 
 using TiledMMA_PV_RemoteP = decltype(make_tiled_mma(
-    GMMA::MMA_64x256x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::MN>{},
+    std::conditional_t<WIDE_PRODUCER, GMMA::MMA_64x128x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::MN>, GMMA::MMA_64x256x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::MN>>{},
     Layout<Shape<_1, _1, _1>>{}
 ));
 

@@ -42,7 +42,7 @@ def gen_testcase() -> list[RemnantTestParam]:
     return [
         RemnantTestParam(num_heads, batch, topk_length)
         for num_heads in (64, 128)
-        for batch in (8, 16)
+        for batch in (8, 16, 32)
         for topk_length in (512, 317)
     ]
 
@@ -189,7 +189,7 @@ def test_direct_decode_bitmap_expansion_edge_patterns(num_heads: int):
 
 
 @pytest.mark.parametrize("num_heads", [64, 128], ids=lambda heads: f"H{heads}")
-@pytest.mark.parametrize("batch", [8, 16], ids=lambda batch: f"B{batch}")
+@pytest.mark.parametrize("batch", [8, 16, 32], ids=lambda batch: f"B{batch}")
 def test_direct_decode_cuda_graph_replay(num_heads: int, batch: int):
     case = make_remnant_case(num_heads, 512, batch=batch)
     meta = flash_mla.get_mla_metadata()[0]
