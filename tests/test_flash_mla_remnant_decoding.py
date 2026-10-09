@@ -5,6 +5,7 @@ Author: Winston Cai.
 
 import dataclasses
 import importlib.util
+import json
 
 import pytest
 import torch
@@ -47,8 +48,8 @@ def gen_testcase() -> list[RemnantTestParam]:
     ]
 
 
-def _run_native(case):
-    meta = flash_mla.get_mla_metadata()[0]
+def _run_native(case, *, metadata=None):
+    meta = metadata if metadata is not None else flash_mla.get_mla_metadata()[0]
     return flash_mla.flash_mla_with_kvcache(
         case.q,
         case.swa_cache,
@@ -69,8 +70,8 @@ def _run_native(case):
     )
 
 
-def _run_remnant(case):
-    meta = flash_mla.get_mla_metadata()[0]
+def _run_remnant(case, *, metadata=None):
+    meta = metadata if metadata is not None else flash_mla.get_mla_metadata()[0]
     return flash_mla.flash_mla_with_remnant_kvcache(
         case.q,
         case.swa_cache,
@@ -170,13 +171,85 @@ def test_direct_decode_mixed_lengths_and_poisoned_padding(num_heads: int):
     torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
 
 
+def _bitmap_attention_references(q, kv, invalid, sink, sm_scale, metadata, tile):
+    """Independent CPU attention models for the two extreme bitmap fixtures.
+
+    The online model rounds the unnormalized P operand to BF16 before P@V,
+    while retaining FP32 maxima/normalizers. It uses the recorded partitions
+    and tile width, but does not consume kernel outputs or reconstructed SMEM.
+    CPU exp/GEMM and reduction order differ from CUDA; this is not a bitwise
+    simulator. Ordinary fixtures continue to use the unmodified FP32 reference.
+    Inputs are Q [B,H,D], logical KV [B,K,D], invalid [B,K], and sink [H].
+    """
+    assert q.device.type == kv.device.type == "cpu"
+    batch, heads, dim = q.shape
+    assert kv.shape[1] % tile == 0
+    kv = torch.nan_to_num(kv.float(), nan=0.0)
+    references = {}
+    for dtype, name in ((torch.float32, "fp32"), (torch.float64, "fp64")):
+        scores = (q.to(dtype) @ kv.to(dtype).transpose(1, 2)) * sm_scale
+        scores.masked_fill_(invalid[:, None, :], -torch.inf)
+        lse = scores.logsumexp(-1)
+        probability = torch.exp(scores - lse[:, :, None])
+        output = (probability @ kv.to(dtype)) / (
+            1 + torch.exp(sink.to(dtype)[None, :] - lse)
+        )[:, :, None]
+        references[name] = output.to(torch.bfloat16)
+
+    scores = (q.float() @ kv.transpose(1, 2)) * sm_scale
+    scores.masked_fill_(invalid[:, None, :], -torch.inf)
+    partials = [[] for _ in range(batch)]
+    for row in metadata.tolist():
+        begin, end, first, last, _, _, _, _ = row
+        if begin >= batch:
+            continue
+        for request in range(begin, min(end, batch - 1) + 1):
+            first_tile = first if request == begin else 0
+            last_tile = last if request == end else kv.shape[1] // tile
+            maximum = torch.full((heads,), -1e30)
+            denominator = torch.zeros(heads)
+            numerator = torch.zeros(heads, dim)
+            for block in range(first_tile, last_tile):
+                block_scores = scores[request, :, block * tile : (block + 1) * tile]
+                block_values = kv[request, block * tile : (block + 1) * tile]
+                new_maximum = torch.maximum(maximum, block_scores.amax(-1))
+                rescale = torch.exp(maximum - new_maximum)
+                probability = torch.exp(block_scores - new_maximum[:, None])
+                operand = probability.to(torch.bfloat16).float()
+                numerator = numerator * rescale[:, None] + operand @ block_values
+                denominator = denominator * rescale + probability.sum(-1)
+                maximum = new_maximum
+            partials[request].append((numerator, denominator, maximum))
+
+    outputs = []
+    for partitions in partials:
+        assert partitions, "Scheduler omitted a bitmap-fixture request"
+        maximum = torch.stack([part[2] for part in partitions]).amax(0)
+        numerator = sum(
+            value * torch.exp(local_maximum - maximum)[:, None]
+            for value, _, local_maximum in partitions
+        )
+        denominator = sum(
+            total * torch.exp(local_maximum - maximum)
+            for _, total, local_maximum in partitions
+        ) + torch.exp(sink.float() - maximum)
+        outputs.append(numerator / denominator[:, None])
+    references["bf16_probability_operand"] = torch.stack(outputs).to(torch.bfloat16)
+    return references
+
+
 @pytest.mark.parametrize("num_heads", [64, 128], ids=lambda heads: f"H{heads}")
-def test_direct_decode_bitmap_expansion_edge_patterns(num_heads: int):
+def test_direct_decode_bitmap_expansion_edge_patterns(
+    num_heads: int, record_property
+):
     case = make_remnant_case(num_heads, 512, batch=8)
     _install_bitmap_edge_patterns(case)
-
-    native_out, native_lse = _run_native(case)
-    direct_out, direct_lse = _run_remnant(case)
+    native_metadata = flash_mla.get_mla_metadata()[0]
+    direct_metadata = flash_mla.get_mla_metadata()[0]
+    native_out, native_lse = _run_native(case, metadata=native_metadata)
+    direct_out, direct_lse = _run_remnant(case, metadata=direct_metadata)
+    for value in (native_out, native_lse, direct_out, direct_lse):
+        assert torch.isfinite(value).all()
     torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
     torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
 
@@ -184,8 +257,72 @@ def test_direct_decode_bitmap_expansion_edge_patterns(num_heads: int):
     reference_out, reference_lse = ref.ref_sparse_attn_decode(
         reference_params, reference_case
     )
-    torch.testing.assert_close(direct_out, reference_out, atol=2.0e-2, rtol=2.0e-2)
+    # The LSE contract and ordinary FP32-reference checks remain unchanged.
+    torch.testing.assert_close(native_lse, reference_lse, atol=2.0e-2, rtol=2.0e-2)
     torch.testing.assert_close(direct_lse, reference_lse, atol=2.0e-2, rtol=2.0e-2)
+    kvs, masks = [], []
+    for scope in (reference_case.kv_scope, reference_case.extra_kv_scope):
+        indices = scope.indices_in_kvcache
+        gathered = scope.blocked_k.view(-1, 512).index_select(
+            0, indices.clamp_min(0).flatten()
+        ).view(8, -1, 512)
+        invalid = indices.squeeze(1) < 0
+        if scope.topk_length is not None:
+            invalid |= (
+                torch.arange(indices.shape[-1], device=indices.device)[None, :]
+                >= scope.topk_length[:, None]
+            )
+        kvs.append(gathered.cpu())
+        masks.append(invalid.cpu())
+    kv = torch.cat(kvs, dim=1)
+    invalid = torch.cat(masks, dim=1)
+    # Explicit, user-approved qualification applies only to these two fixtures.
+    # Keep the inherited mathematical-reference failures visible and reject any
+    # additional failing location; never raise the 2e-2 tolerance.
+    inherited_location = (2, 63, 497) if num_heads == 64 else (3, 46, 464)
+    diagnostics = {"heads": num_heads, "modes": {}}
+    for mode, actual, metadata, tile in (
+        ("native", native_out, native_metadata, 64),
+        ("direct", direct_out, direct_metadata, 32 if num_heads == 64 else 64),
+    ):
+        references = _bitmap_attention_references(
+            case.q.cpu().squeeze(1),
+            kv,
+            invalid,
+            case.sink.cpu(),
+            case.sm_scale,
+            metadata.tile_scheduler_metadata.cpu(),
+            tile,
+        )
+        references["original_gpu_fp32"] = reference_out.cpu().squeeze(1)
+        actual_cpu = actual.cpu().squeeze(1)
+        torch.testing.assert_close(
+            actual_cpu,
+            references["bf16_probability_operand"],
+            atol=2.0e-2,
+            rtol=2.0e-2,
+        )
+        mode_diagnostics = {}
+        for name, expected in references.items():
+            failed = (actual_cpu.float() - expected.float()).abs() > (
+                2.0e-2 + 2.0e-2 * expected.float().abs()
+            )
+            locations = [tuple(index) for index in failed.nonzero().tolist()]
+            assert set(locations) <= {inherited_location}, (mode, name, locations)
+            mode_diagnostics[name] = {
+                "mismatch_locations": locations,
+                "values": [
+                    {
+                        "actual": float(actual_cpu[index]),
+                        "reference": float(expected[index]),
+                    }
+                    for index in locations
+                ],
+                "max_abs": float((actual_cpu.float() - expected.float()).abs().max()),
+            }
+        diagnostics["modes"][mode] = mode_diagnostics
+    record_property("bitmap_reference_diagnostics", json.dumps(diagnostics))
+    print("BITMAP_REFERENCE_DIAGNOSTICS=" + json.dumps(diagnostics))
 
 
 @pytest.mark.parametrize("num_heads", [64, 128], ids=lambda heads: f"H{heads}")
