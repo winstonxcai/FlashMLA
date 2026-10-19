@@ -1,3 +1,6 @@
+# Workspace metadata. Author: Winston Cai.
+.DS_Store
+
 build
 *.so
 *.egg-info/
