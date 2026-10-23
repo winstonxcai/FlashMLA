@@ -3,9 +3,11 @@
 #include "kernels/params.h"
 
 #include "kernels/sm90/prefill/sparse/phase1.h"
+#ifdef FLASHMLA_ENABLE_SM100
 #include "kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#endif
 
 enum class FwdFeatures : int {
     HEAD_64,
@@ -43,6 +45,7 @@ protected:
     }
 };
 
+#ifdef FLASHMLA_ENABLE_SM100
 class Fwd_Sm100_Head64_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         FwdFeatures::HEAD_64,
@@ -91,6 +94,7 @@ protected:
         sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512>(params);
     }
 };
+#endif
 
 std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &q,
@@ -105,8 +109,12 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     
     Arch arch = Arch();
     bool is_sm90a = arch.is_sm90a();
+#ifdef FLASHMLA_ENABLE_SM100
     bool is_sm100f = arch.is_sm100f();
     TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
+#else
+    TORCH_CHECK(is_sm90a, "Sparse Attention Forward Kernel is only supported on SM90a in this build.");
+#endif
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -207,6 +215,7 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     if (is_sm90a) {
         Fwd_Sm90_Impl fwd_impl;
         fwd_impl.run(params, required_features);
+#ifdef FLASHMLA_ENABLE_SM100
     } else if (is_sm100f) {
         if (h_q == 64) {
             Fwd_Sm100_Head64_Impl fwd_impl;
@@ -232,6 +241,11 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     } else {
         TORCH_CHECK(false, "Unsupported architecture");
     }
+#else
+    } else {
+        TORCH_CHECK(false, "Unsupported architecture");
+    }
+#endif
 
     return {out, max_logits, lse};
 }

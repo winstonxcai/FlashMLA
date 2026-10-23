@@ -1,3 +1,5 @@
+// Authored by Winston Cai.
+
 #pragma once
 
 #include "splitkv_mla.h"
@@ -23,6 +25,354 @@ static constexpr float MAX_INIT_VAL = -1e30;    // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using fp8_e8m0 = __nv_fp8_e8m0;
+
+// Return the exclusive prefix ranks for a four-bit bitmap nibble.  The input
+// is ordered from the bitmap's most-significant bit to its least-significant
+// bit; the result stores one four-bit rank per nibble, e.g. 0xf -> 0x3210.
+// The masked terms are deliberately arithmetic rather than a constant-memory
+// lookup: this keeps the hot rank calculation branch-free and avoids a table
+// read for every reconstructed fragment.
+__device__ __forceinline__ uint32_t remnant_nibble_rank_pack(uint32_t nibble) {
+    return ((nibble & 0x8u) * 0x222u)
+        + ((nibble & 0x4u) * 0x440u)
+        + ((nibble & 0x2u) * 0x800u);
+}
+
+__device__ __forceinline__ uint32_t remnant_byte_rank_pack(uint8_t bits) {
+    const uint32_t high = remnant_nibble_rank_pack(bits >> 4);
+    const uint32_t low = remnant_nibble_rank_pack(bits & 0xf);
+    return (high << 16) | (low + __popc(bits >> 4) * 0x1111u);
+}
+
+// Select four logical coordinates from an already aligned survivor span.
+__device__ __forceinline__ uint32_t remnant_window_fp8x4(
+    uint32_t first, uint32_t second, uint32_t selector, uint32_t keep
+) {
+    const uint32_t gathered = __byte_perm(first, second, selector);
+    const uint32_t sign_bits = (keep * 0x80402010u) & 0x80808080u;
+    uint32_t output_mask;
+    asm("prmt.b32 %0, %1, %2, 0xba98;" : "=r"(output_mask) : "r"(sign_bits), "r"(0u));
+    return gathered & output_mask;
+}
+
+__device__ __forceinline__ uint2 remnant_window_fp8x8(
+    const uint8_t *values, int rank_base, uint8_t mask
+) {
+#ifdef E009_H64_BRANCHLESS_WINDOW
+    // Empty fragments read the initialized 16-byte row pad; output masking
+    // still zeros every coordinate. Nonempty fragments retain their addresses.
+    rank_base = mask == 0 ? 256 : rank_base;
+#else
+    if (mask == 0) return uint2{0, 0};
+#endif
+    const uint2 *window = reinterpret_cast<const uint2 *>(values + (rank_base & ~7));
+    const uint2 first = window[0];
+    const uint2 second = window[1];
+    // Align the first eight survivors once, rather than selecting between the
+    // two eight-byte halves separately for every reconstructed output word.
+    const bool upper_word = (rank_base & 4) != 0;
+    const uint32_t word0 = upper_word ? first.y : first.x;
+    const uint32_t word1 = upper_word ? second.x : first.y;
+    const uint32_t word2 = upper_word ? second.y : second.x;
+    const uint32_t shift = (rank_base & 3) * 8;
+    const uint32_t low = __funnelshift_r(word0, word1, shift);
+    const uint32_t high = __funnelshift_r(word1, word2, shift);
+    const uint32_t selectors = remnant_byte_rank_pack(mask);
+    return uint2{
+        remnant_window_fp8x4(low, high, selectors >> 16, mask >> 4),
+        remnant_window_fp8x4(low, high, selectors & 0xffffu, mask & 0xfu),
+    };
+}
+
+// Keep the survivor window in named registers.  Indexing a byte through an
+// address-taken uint4 array makes nvcc materialize that array in thread-local
+// memory, adding an LDL/STL pair for every reconstructed fragment.
+__device__ __forceinline__ uint8_t remnant_register_byte(
+    const uint4 &first,
+    const uint4 &second,
+    int byte_index
+) {
+    uint32_t word;
+    switch (byte_index >> 2) {
+        case 0: word = first.x; break;
+        case 1: word = first.y; break;
+        case 2: word = first.z; break;
+        case 3: word = first.w; break;
+        case 4: word = second.x; break;
+        case 5: word = second.y; break;
+        case 6: word = second.z; break;
+        default: word = second.w; break;
+    }
+    return static_cast<uint8_t>(word >> ((byte_index & 3) * 8));
+}
+
+template <typename Plan>
+__device__ __forceinline__ void prepare_remnant_row(
+    const SparseAttnDecodeParams &params,
+    Plan &plan,
+    int buf_idx,
+    int row_slot,
+    int block_index,
+    int row_index,
+    bool valid,
+    int lane_idx
+) {
+    const int value_group = lane_idx >> 3;
+    uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
+
+    // Four threads associated with one token each load a contiguous 64-byte
+    // survivor range. The packed record is therefore read once with 128-bit
+    // transactions before logical-coordinate reconstruction begins.
+    if (valid) {
+        const uint8_t *gvalues = params.remnant_values
+            + block_index * params.stride_remnant_values_page
+            + row_index * params.stride_remnant_values_row;
+        for (int offset = 0; offset < 64; offset += 16) {
+            const uint8_t *src = gvalues + value_group * 64 + offset;
+            uint4 chunk;
+            // The external record is 328 B, so successive rows alternate
+            // between 16-byte alignment and an 8-byte offset.  Keep the
+            // coalesced 128-bit path for aligned rows and use two aligned
+            // 64-bit transactions for the other half rather than issuing a
+            // misaligned uint4 load.
+            if ((reinterpret_cast<uintptr_t>(src) & 0xf) == 0) {
+                chunk = __ldg(reinterpret_cast<const uint4 *>(src));
+            } else {
+                const uint2 lo = __ldg(reinterpret_cast<const uint2 *>(src));
+                const uint2 hi = __ldg(reinterpret_cast<const uint2 *>(src + 8));
+                chunk = uint4{lo.x, lo.y, hi.x, hi.y};
+            }
+            *reinterpret_cast<uint4 *>(values + value_group * 64 + offset) = chunk;
+        }
+    }
+
+    // One thread per token loads the bitmap and scale metadata and computes
+    // the word prefix counts shared by the four survivor-loading threads.
+    if (value_group == 0) {
+#ifdef E009_H64_BITMAP_TRANSPOSE
+        uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot;
+#else
+        uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
+#endif
+        uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * Plan::PREFIX_STRIDE;
+        uint8_t *scales = plan.remnant.scales[buf_idx] + row_slot * 8;
+        const uint64_t *gbitmap = params.remnant_bitmaps
+            + block_index * params.stride_remnant_bitmaps_page
+            + row_index * params.stride_remnant_bitmaps_row;
+        const uint8_t *gscales = params.remnant_scales
+            + block_index * params.stride_remnant_scales_page
+            + row_index * params.stride_remnant_scales_row;
+        prefix[0] = 0;
+#ifdef E009_H64_REGISTER_PREFIX
+        int prefix_count = 0;
+#endif
+        for (int word = 0; word < 8; ++word) {
+            uint64_t bits = valid ? __ldg(gbitmap + word) : 0ULL;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+            bitmap[word * 32] = bits;
+#else
+            bitmap[word] = bits;
+#endif
+            scales[word] = valid ? __ldg(gscales + word) : 0;
+#ifdef E009_H64_REGISTER_PREFIX
+            prefix_count += __popcll(bits);
+            prefix[word + 1] = prefix_count;
+#else
+            prefix[word + 1] = prefix[word] + __popcll(bits);
+#endif
+        }
+        *reinterpret_cast<uint4 *>(values + 256) = uint4{0, 0, 0, 0};
+    }
+    __syncwarp();
+}
+
+template <typename Plan>
+__device__ __forceinline__ fp8x8 load_remnant_fp8x8(
+    const Plan &plan,
+    int buf_idx,
+    int row_slot,
+    int dim_base,
+    bool valid
+) {
+    fp8x8 result;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot;
+#else
+    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
+#endif
+    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * Plan::PREFIX_STRIDE;
+    const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
+    const int word = dim_base / 64;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+    const uint64_t keep = valid ? bitmap[word * 32] : 0;
+#else
+    const uint64_t keep = valid ? bitmap[word] : 0;
+#endif
+    const int byte_in_word = (dim_base & 63) >> 3;
+    const uint8_t byte_mask = static_cast<uint8_t>(
+        (keep >> (56 - byte_in_word * 8)) & 0xffu
+    );
+    const uint64_t prior_mask = byte_in_word == 0
+        ? 0ULL
+        : (~0ULL << (64 - byte_in_word * 8));
+    const int rank_base = prefix[word] + __popcll(keep & prior_mask);
+    const uint2 expanded = remnant_window_fp8x8(values, rank_base, byte_mask);
+    *reinterpret_cast<uint32_t *>(&result.lo) = expanded.x;
+    *reinterpret_cast<uint32_t *>(&result.hi) = expanded.y;
+    return result;
+}
+
+template <typename Plan>
+__device__ __forceinline__ fp8x16 load_remnant_fp8x16(
+    const Plan &plan,
+    int buf_idx,
+    int row_slot,
+    int dim_base,
+    bool valid
+) {
+    fp8x16 result;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot;
+#else
+    const uint64_t *bitmap = plan.remnant.bitmaps[buf_idx] + row_slot * 8;
+#endif
+    const uint16_t *prefix = plan.remnant.rank_prefix[buf_idx] + row_slot * Plan::PREFIX_STRIDE;
+    const uint8_t *values = plan.remnant.values[buf_idx] + row_slot * 272;
+    const int word = dim_base / 64;
+#ifdef E009_H64_BITMAP_TRANSPOSE
+    const uint64_t keep = valid ? bitmap[word * 32] : 0;
+#else
+    const uint64_t keep = valid ? bitmap[word] : 0;
+#endif
+    const int byte_in_word = (dim_base & 63) >> 3;
+    const uint8_t first_mask = static_cast<uint8_t>(
+        (keep >> (56 - byte_in_word * 8)) & 0xffu
+    );
+    const uint8_t second_mask = static_cast<uint8_t>(
+        (keep >> (48 - byte_in_word * 8)) & 0xffu
+    );
+    const uint64_t prior_mask = byte_in_word == 0
+        ? 0ULL
+        : (~0ULL << (64 - byte_in_word * 8));
+    const int rank_base = prefix[word] + __popcll(keep & prior_mask);
+    const uint2 first = remnant_window_fp8x8(values, rank_base, first_mask);
+    const uint2 second = remnant_window_fp8x8(values, rank_base + __popc(first_mask), second_mask);
+    *reinterpret_cast<uint32_t *>(&result.lo.lo) = first.x;
+    *reinterpret_cast<uint32_t *>(&result.lo.hi) = first.y;
+    *reinterpret_cast<uint32_t *>(&result.hi.lo) = second.x;
+    *reinterpret_cast<uint32_t *>(&result.hi.hi) = second.y;
+    return result;
+}
+
+struct RemnantEightWord {
+    uint64_t keep;
+    int prefix;
+    uint8_t scale;
+};
+
+// Eight lanes, four lanes apart, own one bitmap word each. Eight warps still
+// cover32rows. The packed input and initialized16-byte padding are unchanged.
+template<typename Plan>
+__device__ __forceinline__ RemnantEightWord prepare_remnant_eight(
+    const SparseAttnDecodeParams &p, Plan &s, int buf, int token, int page, int row,
+    bool valid, int lane) {
+    int word=lane/4;
+    const uint64_t *bitmap=p.remnant_bitmaps+page*p.stride_remnant_bitmaps_page
+                          +row*p.stride_remnant_bitmaps_row+word;
+    uint64_t keep=valid?__ldg(bitmap):0;
+    int count=__popcll(keep),scan=count;
+    #pragma unroll
+    for(int distance=1;distance<=4;distance*=2) {
+        int preceding=__shfl_up_sync(0xffffffff,scan,distance*4);
+        if(word>=distance) scan+=preceding;
+    }
+    uint2 codes{0,0};
+    if(word==0 && valid) {
+        const uint8_t *ptr=p.remnant_scales+page*p.stride_remnant_scales_page
+                          +row*p.stride_remnant_scales_row;
+        if((reinterpret_cast<uintptr_t>(ptr)&7)==0) codes=__ldg(reinterpret_cast<const uint2*>(ptr));
+        else {
+            #pragma unroll
+            for(int j=0;j<4;++j) {
+                codes.x|=uint32_t(__ldg(ptr+j))<<(j*8);
+                codes.y|=uint32_t(__ldg(ptr+j+4))<<(j*8);
+            }
+        }
+    }
+    codes.x=__shfl_sync(0xffffffff,codes.x,lane%4);
+    codes.y=__shfl_sync(0xffffffff,codes.y,lane%4);
+    uint8_t *local=s.remnant.values[buf]+token*272;
+    if(valid) {
+        const uint8_t *global=p.remnant_values+page*p.stride_remnant_values_page
+                              +row*p.stride_remnant_values_row;
+        #pragma unroll 1
+        for(int offset=0;offset<32;offset+=16) {
+            const uint8_t *ptr=global+word*32+offset;
+            uint4 chunk;
+            if((reinterpret_cast<uintptr_t>(ptr)&15)==0) chunk=__ldg(reinterpret_cast<const uint4*>(ptr));
+            else {
+                uint2 a=__ldg(reinterpret_cast<const uint2*>(ptr));
+                uint2 b=__ldg(reinterpret_cast<const uint2*>(ptr+8));
+                chunk=uint4{a.x,a.y,b.x,b.y};
+            }
+            *reinterpret_cast<uint4*>(local+word*32+offset)=chunk;
+        }
+    }
+    if(word==0) *reinterpret_cast<uint4*>(local+256)=uint4{0,0,0,0};
+    __syncwarp();
+    uint32_t packed_codes=word<4?codes.x:codes.y;
+    return {keep,scan-count,uint8_t(packed_codes>>((word%4)*8))};
+}
+template<typename Plan>
+__device__ __forceinline__ const uint8_t *remnant_eight_values(const Plan &plan, int buf, int row) {
+    return plan.remnant.values[buf] + row * 272;
+}
+
+__device__ __forceinline__ fp8x16 expand_remnant_eight16(
+    const uint8_t *values,uint64_t keep,int prefix,int fragment) {
+    int shift=fragment*16;
+    uint8_t first_mask=uint8_t(keep>>(56-shift));
+    uint8_t second_mask=uint8_t(keep>>(48-shift));
+    uint64_t prior=shift==0?0ULL:(~0ULL<<(64-shift));
+    int rank=prefix+__popcll(keep&prior);
+    uint2 a=remnant_window_fp8x8(values,rank,first_mask);
+    uint2 b=remnant_window_fp8x8(values,rank+__popc(first_mask),second_mask);
+    fp8x16 raw;
+    *reinterpret_cast<uint32_t*>(&raw.lo.lo)=a.x;
+    *reinterpret_cast<uint32_t*>(&raw.lo.hi)=a.y;
+    *reinterpret_cast<uint32_t*>(&raw.hi.lo)=b.x;
+    *reinterpret_cast<uint32_t*>(&raw.hi.hi)=b.y;
+    return raw;
+}
+
+__device__ __forceinline__ fp8x8 expand_remnant_eight8(
+    const uint8_t *values, uint64_t keep, int prefix, int fragment) {
+    const int shift = fragment * 8;
+    const uint8_t mask = uint8_t(keep >> (56 - shift));
+    const uint64_t prior = shift == 0 ? 0ULL : (~0ULL << (64 - shift));
+    const uint2 raw = remnant_window_fp8x8(values, prefix + __popcll(keep & prior), mask);
+    fp8x8 result;
+    *reinterpret_cast<uint32_t *>(&result.lo) = raw.x;
+    *reinterpret_cast<uint32_t *>(&result.hi) = raw.y;
+    return result;
+}
+
+template <typename Plan>
+__device__ __forceinline__ bf16 remnant_scale(
+    const Plan &plan,
+    int buf_idx,
+    int row_slot,
+    int word,
+    bool valid
+) {
+    const uint8_t *scales = plan.remnant.scales[buf_idx] + row_slot * 8;
+    const int code = valid ? static_cast<int>(scales[word]) : 0;
+#ifdef E009_H64_BITCAST_SCALE
+    return bf16::bitcast(static_cast<uint16_t>(code << 7));
+#else
+    return (bf16)__int_as_float(code << 23);
+#endif
+}
 
 template<
     typename Tensor0,
@@ -83,9 +433,9 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
 template<typename TMAParams>
-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
@@ -118,14 +468,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         if constexpr (CLUSTER_SIZE == 2) {
             CUTE_UNROLL
             for (int i = 0; i < NUM_K_BUFS; ++i) {
-                plan.bar_k_local_ready[i].init(128);
+                plan.bar_k_local_ready[i].init(WIDE_PRODUCER ? 256 : 128);
                 plan.bar_k_remote_ready[i].init(1);
                 plan.bar_k_avail[i].init(4);
             }
         } else {
             CUTE_UNROLL
             for (int i = 0; i < NUM_K_BUFS; ++i) {
-                plan.bar_k_local_ready[i].init(128);
+                plan.bar_k_local_ready[i].init(WIDE_PRODUCER ? 256 : 128);
                 plan.bar_k_avail[i].init(256);
             }
         }
@@ -221,11 +571,47 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
                 Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutHalfV{});
 
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                // Optional debug timing is taken by one elected WG0 lane. This
+                // is that lane's elapsed SM-clock interval, not summed warp time.
+                const bool record_ready_wait =
+                    params.ready_wait_cycles != nullptr && idx_in_warpgroup == 0;
+                unsigned long long local_wait_start = 0;
+                unsigned long long local_wait_end = 0;
+                unsigned long long remote_wait_start = 0;
+                unsigned long long remote_wait_end = 0;
+#endif
+
                 // Wait, issue WGMMA
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                if (record_ready_wait) local_wait_start = clock64();
+#endif
                 plan.bar_k_local_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                if (record_ready_wait) local_wait_end = clock64();
+#endif
                 if constexpr (CLUSTER_SIZE == 2) {
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                    if (record_ready_wait) remote_wait_start = clock64();
+#endif
                     plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                    if (record_ready_wait) remote_wait_end = clock64();
+#endif
                 }
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+                if (record_ready_wait) {
+                    const int ready_wait_blocks =
+                        (params.topk + TOPK_BLOCK_SIZE - 1) / TOPK_BLOCK_SIZE +
+                        (params.extra_topk + TOPK_BLOCK_SIZE - 1) / TOPK_BLOCK_SIZE;
+                    const size_t record =
+                        (((static_cast<size_t>(partition_idx) * params.s_q + s_q_idx) *
+                          NUM_M_BLOCKS + head_block_idx) * ready_wait_blocks + block_idx) * 3;
+                    params.ready_wait_cycles[record] = local_wait_end - local_wait_start;
+                    params.ready_wait_cycles[record + 1] = remote_wait_end - remote_wait_start;
+                    params.ready_wait_cycles[record + 2] = block_idx - args.start_block_idx;
+                }
+#endif
 
                 gemm<true, -1>(
                     tiled_mma_QK,
@@ -240,7 +626,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 
                 // Calculate S = softmax(mask(scale(P)))
                 if (block_idx != args.start_block_idx)
-                    NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);  // Make sure that sScale and sS is free
+                    consumer_barrier_sync<NamedBarriers::sScale_and_sS_free>();  // Make sure that sScale and sS is free
 
                 // Since in our case TOPK_BLOCK_SIZE == BLOCK_M, so we only need to do OOB checking for the last 2 blocks
                 scale_softmax(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
@@ -257,7 +643,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     rO
                 );
 
-                NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_ready);
+                consumer_barrier_arrive<NamedBarriers::sScale_and_sS_ready>();
 
                 cute::warpgroup_wait<0>();
 
@@ -316,7 +702,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             // This is a synchronization point for warpgroup 0/1.
             // Warpgroup 0 should wait wg 1 for oBuf/oAccumBuf (overlapped with k) to be free
             // Warpgroup 1 should wait wg 0 for sL to be ready
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
+            consumer_barrier_sync<NamedBarriers::oBuf_free_and_sL_ready>();
 
             CUTE_UNROLL
             for (int i = 0; i < 2; ++i)
@@ -364,7 +750,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             sync_all_threads_in_cluster();
         }
     } else if (warpgroup_idx == 1) {
-        cutlass::arch::warpgroup_reg_dealloc<160>();
+        if constexpr (WIDE_PRODUCER) cutlass::arch::warpgroup_reg_alloc<160>();
+        else cutlass::arch::warpgroup_reg_dealloc<160>();
 
         TiledMMA tiled_mma_PV = TiledMMA_PV_RemoteP{};
         ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
@@ -380,8 +767,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
                 Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
 
+                // Diagnostic direct acquire: redundant with WG0's handoff,
+                // but gives racecheck an explicit producer-to-WG1 dependency.
+                if constexpr (WIDE_PRODUCER) {
+                    plan.bar_k_local_ready[buf_idx].wait((bar_phase_k >> buf_idx) & 1);
+                    bar_phase_k ^= 1 << buf_idx;
+                }
                 // Wait for S and sScale
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_ready);
+                consumer_barrier_sync<NamedBarriers::sScale_and_sS_ready>();
 
                 // Scale O
                 float cur_scales[2];
@@ -412,10 +805,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 }
                 
                 if (block_idx != args.end_block_idx-1)
-                    NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_free);   // Tell WG0 that sScale and sS are available
+                    consumer_barrier_arrive<NamedBarriers::sScale_and_sS_free>();   // Tell WG0 that sScale and sS are available
             }
 
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
+            consumer_barrier_sync<NamedBarriers::oBuf_free_and_sL_ready>();
 
             float o_scales[2];
             CUTE_UNROLL
@@ -453,22 +846,30 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         }
     } else {
         // Producer warpgroup
-        cutlass::arch::warpgroup_reg_dealloc<152>();
+        if constexpr (WIDE_PRODUCER) cutlass::arch::warpgroup_reg_dealloc<80>();
+        else cutlass::arch::warpgroup_reg_dealloc<152>();
 
         static_assert(CLUSTER_SIZE == 1 || CLUSTER_SIZE == 2);
-        static constexpr int NUM_TOKENS_PER_THREAD = CLUSTER_SIZE == 1 ? 2 : 1;
-        static constexpr int NUM_TOKENS_PER_ROUND = 32; // If head is 128, each CTA is responsible for dequantizing 32 tokens (1 rounds); if head is 64, each CTA is responsible for dequantizing 64 tokens (2 rounds)
-        int warp_idx = __shfl_sync(0xffffffff, idx_in_warpgroup / 32, 0);
+        static constexpr int NUM_TOKENS_PER_THREAD = TOPK_BLOCK_SIZE / CLUSTER_SIZE / 32;
+        static_assert(NUM_TOKENS_PER_THREAD >= 1);
+        static constexpr int NUM_TOKENS_PER_ROUND = 32; // H64 uses one or two rounds according to tile width; H128 uses one.
+        const int idx_in_producer = WIDE_PRODUCER ? int(threadIdx.x) - 256 : idx_in_warpgroup;
+        int warp_idx = __shfl_sync(0xffffffff, idx_in_producer / 32, 0);
         int lane_idx = idx_in_warpgroup % 32;
-        int my_token_idx_base = warp_idx*8 + lane_idx%8;
+        int my_token_idx_base = WIDE_PRODUCER ? warp_idx*4 + lane_idx%4 : warp_idx*8 + lane_idx%8;
         
         CUTE_NO_UNROLL
         for (int batch_idx = sched_meta.begin_req_idx; batch_idx <= sched_meta.end_req_idx; ++batch_idx) {
             MainloopArgs args = get_cur_req_info(batch_idx);
             int* gIndices = params.indices + batch_idx*params.stride_indices_b + s_q_idx*params.stride_indices_s_q; // (topk) : (1)
             int* gExtraIndices = params.extra_indices + batch_idx*params.stride_extra_indices_b + s_q_idx*params.stride_extra_indices_s_q; // (extra_topk) : (1)
+            int* gExtraRawIndices = nullptr;
+            if constexpr (REMNANT) {
+                gExtraRawIndices = params.remnant_raw_indices + batch_idx*params.stride_remnant_raw_indices_b + s_q_idx*params.stride_remnant_raw_indices_s_q;
+            }
             
             int nxt_token_indexs[NUM_TOKENS_PER_THREAD];
+            int nxt_raw_token_indices[NUM_TOKENS_PER_THREAD];
             CUTE_UNROLL
             for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
                 if (IS_V32_LIKE || args.start_block_idx < args.num_orig_kv_blocks)
@@ -497,7 +898,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     k_ptr = (fp8*)params.kv;
                 } else {
                     indices_base = gExtraIndices + (block_idx-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE;
-                    page_block_size = params.extra_page_block_size;
+                    page_block_size = REMNANT ? params.remnant_page_size : params.extra_page_block_size;
                     k_block_stride = params.stride_extra_kv_block;
                     k_row_stride = params.stride_extra_kv_row;
                     k_ptr = (fp8*)params.extra_kv;
@@ -514,6 +915,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     // Get prefetched token index
                     int token_index;
+                    int raw_token_index = -1;
                     if constexpr (!IS_EXTRA_BLOCK) {
                         token_index = nxt_token_indexs[round];
                         if (block_idx+1 != (IS_V32_LIKE ? args.end_block_idx : args.num_orig_kv_blocks))
@@ -521,26 +923,40 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     } else {
                         if constexpr (IS_FIRST_EXTRA_BLOCK) {
                             token_index = __ldg(gExtraIndices + (block_idx-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
+                            if constexpr (REMNANT)
+                                raw_token_index = __ldg(gExtraRawIndices + (block_idx-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
                         } else {
                             token_index = nxt_token_indexs[round];
+                            if constexpr (REMNANT)
+                                raw_token_index = nxt_raw_token_indices[round];
                         }
-                        if (block_idx+1 != args.end_block_idx)
+                        if (block_idx+1 != args.end_block_idx) {
                             nxt_token_indexs[round] = __ldg(gExtraIndices + (block_idx+1-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
+                            if constexpr (REMNANT)
+                                nxt_raw_token_indices[round] = __ldg(gExtraRawIndices + (block_idx+1-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
+                        }
                     }
                     
                     if constexpr (MODEL_TYPE == ModelType::V4) {
                         // For DeepSeek-V4, we need to check whether the token_index is within topk_length
                         if (rel_block_idx*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx >= topk_length) {
                             token_index = -1;   // To prevent IMA when we have invalid (e.g. INT_MAX) topk indexes outside topk_length
+                            if constexpr (REMNANT)
+                                raw_token_index = -1;
                         }
                     }
 
                     int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
-                    fp8* gK_base;
+                    const bool remnant_valid = token_index != -1 && raw_token_index >= 0;
+                    const int remnant_row_slot = my_token_idx % REMNANT_ROWS;
+
+                    fp8* gK_base = nullptr;
                     bf16 scales[NUM_SCALES];
-                    if constexpr (IS_V32_LIKE) {
+                    if constexpr (REMNANT && MODEL_TYPE == ModelType::V4 && IS_EXTRA_BLOCK) {
+                        // Packed rows are expanded below, not loaded from extra_kv.
+                    } else if constexpr (IS_V32_LIKE) {
                         static_assert(NUM_SCALES == 4);
                         gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride;
                         float scales_float[NUM_SCALES];
@@ -565,14 +981,207 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     if (round == 0) {
                         plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
                     }
+
+                    if constexpr (REMNANT && !WIDE_PRODUCER && MODEL_TYPE == ModelType::V4 && IS_EXTRA_BLOCK) {
+                        const int packed_page = remnant_valid ? block_index : 0;
+                        const int packed_row = remnant_valid ? rel_idx_in_block : 0;
+                        prepare_remnant_row(
+                            params, plan, buf_idx, remnant_row_slot,
+                            packed_page, packed_row, remnant_valid, lane_idx
+                        );
+                    }
                     
                     if (CLUSTER_SIZE == 2 && round == 0 && idx_in_warpgroup == 0) {
                         plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
                     }
 
+                    bf16* sK_rope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
+                    bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
+
                     // Collectively copy from global memory and dequant
                     // For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
-                    
+                    if constexpr (WIDE_PRODUCER && IS_EXTRA_BLOCK) {
+                        static_assert(!WIDE_PRODUCER || (CLUSTER_SIZE == 1 && TOPK_BLOCK_SIZE == 32));
+                        const bool valid = remnant_valid;
+                        const int word = lane_idx / 4;
+                        const auto metadata = prepare_remnant_eight(
+                            params, plan, buf_idx, remnant_row_slot,
+                            valid ? block_index : 0, valid ? rel_idx_in_block : 0,
+                            valid, lane_idx);
+                        // All lanes participate before divergent NoPE ownership.
+                        const int tail_lane = 28 + lane_idx % 4;
+                        const uint64_t tail_keep = __shfl_sync(0xffffffff, static_cast<unsigned long long>(metadata.keep), tail_lane);
+                        const int tail_prefix = __shfl_sync(0xffffffff, metadata.prefix, tail_lane);
+                        const int tail_code = __shfl_sync(0xffffffff, int(metadata.scale), tail_lane);
+                        const uint8_t *packed_values = remnant_eight_values(plan, buf_idx, remnant_row_slot);
+                        if (word < 7) {
+                            const bf16 scale = bf16::bitcast(uint16_t(metadata.scale) << 7);
+                            const auto scale2 = __bfloat162bfloat162(*reinterpret_cast<const __nv_bfloat16 *>(&scale));
+                            #pragma unroll 4
+                            for (int fragment = 0; fragment < 4; ++fragment) {
+                                const fp8x16 raw = expand_remnant_eight16(packed_values, metadata.keep, metadata.prefix, fragment);
+                                bf16x8 a = cvt_fp8x8_bf16x8(raw.lo, scale2);
+                                bf16x8 b = cvt_fp8x8_bf16x8(raw.hi, scale2);
+                                if (!valid) {
+                                    *reinterpret_cast<uint4 *>(&a) = uint4{0, 0, 0, 0};
+                                    *reinterpret_cast<uint4 *>(&b) = uint4{0, 0, 0, 0};
+                                }
+                                bf16 *destination = plan.u.k[buf_idx].data() + my_token_idx * 8
+                                    + (word * 64 + fragment * 16) * TOPK_BLOCK_SIZE;
+                                *reinterpret_cast<uint4 *>(destination) = *reinterpret_cast<uint4 *>(&a);
+                                *reinterpret_cast<uint4 *>(destination + 8 * TOPK_BLOCK_SIZE) = *reinterpret_cast<uint4 *>(&b);
+                            }
+                        }
+                        const int rope_base_dim = word * 8;
+                        const fp8x8 raw_tail = expand_remnant_eight8(packed_values, tail_keep, tail_prefix, word);
+                        const bf16 scale = bf16::bitcast(uint16_t(tail_code) << 7);
+                        bf16x8 cur = cvt_fp8x8_bf16x8(raw_tail, __bfloat162bfloat162(*reinterpret_cast<const __nv_bfloat16 *>(&scale)));
+                            float values[8] = {
+                                (float)cur.a01.x, (float)cur.a01.y,
+                                (float)cur.a23.x, (float)cur.a23.y,
+                                (float)cur.a45.x, (float)cur.a45.y,
+                                (float)cur.a67.x, (float)cur.a67.y,
+                            };
+                            if (valid) {
+                                const int first_pair = raw_token_index * 4 * 32
+                                    + rope_base_dim / 2;
+                                const float *frequency = params.remnant_freqs + first_pair * 2;
+                                float4 first, second;
+                                // Four contiguous cosine/sine values per load.
+                                // Preserve support for contiguous frequency views
+                                // whose storage offset is not 16-byte aligned.
+                                if ((reinterpret_cast<uintptr_t>(frequency) & 15) == 0) {
+                                    first = __ldg(reinterpret_cast<const float4 *>(frequency));
+                                    second = __ldg(reinterpret_cast<const float4 *>(frequency + 4));
+                                } else {
+                                    first = float4{__ldg(frequency), __ldg(frequency + 1),
+                                                   __ldg(frequency + 2), __ldg(frequency + 3)};
+                                    second = float4{__ldg(frequency + 4), __ldg(frequency + 5),
+                                                    __ldg(frequency + 6), __ldg(frequency + 7)};
+                                }
+                                auto rotate_pair = [&](int pair, float c, float s) {
+                                    const float x0 = values[pair * 2];
+                                    const float x1 = values[pair * 2 + 1];
+                                    values[pair * 2] = x0 * c - x1 * s;
+                                    values[pair * 2 + 1] = x0 * s + x1 * c;
+                                };
+                                rotate_pair(0, first.x, first.y);
+                                rotate_pair(1, first.z, first.w);
+                                rotate_pair(2, second.x, second.y);
+                                rotate_pair(3, second.z, second.w);
+                            } else {
+                                for (int i = 0; i < 8; ++i)
+                                    values[i] = 0.0f;
+                            }
+                            cur.a01 = __float22bfloat162_rn({values[0], values[1]});
+                            cur.a23 = __float22bfloat162_rn({values[2], values[3]});
+                            cur.a45 = __float22bfloat162_rn({values[4], values[5]});
+                            cur.a67 = __float22bfloat162_rn({values[6], values[7]});
+                        bf16 *destination = plan.u.k[buf_idx].data() + my_token_idx * 8
+                            + (HEAD_DIM_NOPE + rope_base_dim) * TOPK_BLOCK_SIZE;
+                        *reinterpret_cast<uint4 *>(destination) = *reinterpret_cast<uint4 *>(&cur);
+                    } else if constexpr (REMNANT && MODEL_TYPE == ModelType::V4 && IS_EXTRA_BLOCK) {
+                        const bool valid = token_index != -1 && raw_token_index >= 0;
+                        const int value_base_dim = (lane_idx / 8) * 16;
+                        const int packed_page = valid ? block_index : 0;
+                        const int packed_row = valid ? rel_idx_in_block : 0;
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE / 64; ++dim_idx) {
+                            const int dim_base = dim_idx * 64 + value_base_dim;
+                            fp8x16 packed = load_remnant_fp8x16(
+                                plan, buf_idx, remnant_row_slot, dim_base, valid
+                            );
+                            bf16 scale = remnant_scale(plan, buf_idx, remnant_row_slot, dim_idx, valid);
+                            bf16x8 first_bf16 = cvt_fp8x8_bf16x8(packed.lo, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            bf16x8 second_bf16 = cvt_fp8x8_bf16x8(packed.hi, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            if (!valid) {
+                                *(uint128_t*)(&first_bf16) = uint128_t();
+                                *(uint128_t*)(&second_bf16) = uint128_t();
+                            }
+                            int smem_offset = (dim_idx * 64) * TOPK_BLOCK_SIZE;
+                            *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&first_bf16;
+                            *(__int128_t*)(sK_nope_base + smem_offset + 8 * TOPK_BLOCK_SIZE) = *(__int128_t*)&second_bf16;
+                            if constexpr (CLUSTER_SIZE == 2) {
+                                st_async_128b(sK_nope_peer_base + smem_offset, first_bf16, peer_bar_k_remote_ready);
+                                st_async_128b(sK_nope_peer_base + smem_offset + 8 * TOPK_BLOCK_SIZE, second_bf16, peer_bar_k_remote_ready);
+                            }
+                        }
+
+                        // The packed record contains the unrotated tail. Apply
+                        // the model's four-position RoPE stride before storing it.
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE / 32; ++dim_idx) {
+                            const int rope_base_dim = (lane_idx / 8) * 8;
+                            const int dim_base = HEAD_DIM_NOPE + dim_idx * 32 + rope_base_dim;
+                            fp8x8 first = load_remnant_fp8x8(plan, buf_idx, remnant_row_slot, dim_base, valid);
+                            bf16 scale = remnant_scale(plan, buf_idx, remnant_row_slot, 7, valid);
+                            bf16x8 cur = cvt_fp8x8_bf16x8(first, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            float values[8] = {
+                                (float)cur.a01.x, (float)cur.a01.y,
+                                (float)cur.a23.x, (float)cur.a23.y,
+                                (float)cur.a45.x, (float)cur.a45.y,
+                                (float)cur.a67.x, (float)cur.a67.y,
+                            };
+                            if (valid) {
+                                const int first_pair = raw_token_index * 4 * 32
+                                    + dim_idx * 16 + rope_base_dim / 2;
+                                const float *frequency = params.remnant_freqs + first_pair * 2;
+                                float4 first, second;
+                                // Four contiguous cosine/sine values per load.
+                                // Preserve support for contiguous frequency views
+                                // whose storage offset is not 16-byte aligned.
+                                if ((reinterpret_cast<uintptr_t>(frequency) & 15) == 0) {
+                                    first = __ldg(reinterpret_cast<const float4 *>(frequency));
+                                    second = __ldg(reinterpret_cast<const float4 *>(frequency + 4));
+                                } else {
+                                    first = float4{__ldg(frequency), __ldg(frequency + 1),
+                                                   __ldg(frequency + 2), __ldg(frequency + 3)};
+                                    second = float4{__ldg(frequency + 4), __ldg(frequency + 5),
+                                                    __ldg(frequency + 6), __ldg(frequency + 7)};
+                                }
+                                auto rotate_pair = [&](int pair, float c, float s) {
+                                    const float x0 = values[pair * 2];
+                                    const float x1 = values[pair * 2 + 1];
+                                    values[pair * 2] = x0 * c - x1 * s;
+                                    values[pair * 2 + 1] = x0 * s + x1 * c;
+                                };
+                                rotate_pair(0, first.x, first.y);
+                                rotate_pair(1, first.z, first.w);
+                                rotate_pair(2, second.x, second.y);
+                                rotate_pair(3, second.z, second.w);
+                            } else {
+                                for (int i = 0; i < 8; ++i)
+                                    values[i] = 0.0f;
+                            }
+                            cur.a01 = __float22bfloat162_rn({values[0], values[1]});
+                            cur.a23 = __float22bfloat162_rn({values[2], values[3]});
+                            cur.a45 = __float22bfloat162_rn({values[4], values[5]});
+                            cur.a67 = __float22bfloat162_rn({values[6], values[7]});
+                            const int smem_offset = (HEAD_DIM_NOPE + dim_idx * 32) * TOPK_BLOCK_SIZE;
+                            *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&cur;
+                            if constexpr (CLUSTER_SIZE == 2)
+                                st_async_128b(sK_rope_peer_base + smem_offset, cur, peer_bar_k_remote_ready);
+                        }
+                    } else if constexpr (WIDE_PRODUCER) {
+                        static_assert(!WIDE_PRODUCER || (MODEL_TYPE == ModelType::V4 && CLUSTER_SIZE == 1));
+                        const int group = lane_idx / 4;
+                        const int coordinate = group * 8;
+                        #pragma unroll
+                        for (int word = 0; word < HEAD_DIM_NOPE / 64; ++word) {
+                            fp8x8 raw;
+                            *reinterpret_cast<uint64_t *>(&raw) = __ldg(reinterpret_cast<const uint64_t *>(gK_base + word * 64 + coordinate));
+                            if (token_index == -1) *reinterpret_cast<uint64_t *>(&raw) = 0;
+                            bf16 scale = token_index == -1 ? bf16(0.0f) : scales[word];
+                            bf16x8 value = cvt_fp8x8_bf16x8(raw, __bfloat162bfloat162(*reinterpret_cast<const __nv_bfloat16 *>(&scale)));
+                            bf16 *destination = plan.u.k[buf_idx].data() + my_token_idx * 8
+                                + (word * 64 + coordinate) * TOPK_BLOCK_SIZE;
+                            *reinterpret_cast<uint4 *>(destination) = *reinterpret_cast<uint4 *>(&value);
+                        }
+                        bf16 *source = reinterpret_cast<bf16 *>(gK_base + HEAD_DIM_NOPE) + coordinate;
+                        bf16x8 tail = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(source);
+                        if (token_index == -1) *reinterpret_cast<uint4 *>(&tail) = uint4{0, 0, 0, 0};
+                        bf16 *destination = plan.u.k[buf_idx].data() + my_token_idx * 8
+                            + (HEAD_DIM_NOPE + coordinate) * TOPK_BLOCK_SIZE;
+                        *reinterpret_cast<uint4 *>(destination) = *reinterpret_cast<uint4 *>(&tail);
+                    } else {
                     fp8* gK_nope = gK_base + (lane_idx/8)*16;
                     if (token_index == -1) {
                         CUTE_UNROLL
@@ -605,9 +1214,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     } else {
                         gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE) + (lane_idx/8)*8;
                     }
-                    bf16* sK_rope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
-                    bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
-
                     CUTE_UNROLL
                     for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
                         bf16x8 cur_bf16x8 = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(gK_rope + dim_idx*32);
@@ -623,11 +1229,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             st_async_128b(sK_rope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
                         }
                     }
+                    }
                 }
 
                 fence_view_async_shared();
 
-                if (idx_in_warpgroup < 32) {
+                if (idx_in_producer < TOPK_BLOCK_SIZE / 2) {
                     // We put this after fence_view_async_shared() since this won't be read by async proxy
                     auto is_index_valid = [&](int index, int offset_within_thread) -> bool {
                         if constexpr (IS_V32_LIKE) {
@@ -685,8 +1292,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     Kernel::devfunc(params, tma_params);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
-void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &params) {
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
+void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
     KU_ASSERT(params.d_qk == HEAD_DIM_K);
@@ -751,7 +1358,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         shape_Q, tma_Q,
         tensor_map_o
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -782,9 +1389,9 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
 void run_flash_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams &params) {
-    KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(params);
+    KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(params);
 }
 
 }

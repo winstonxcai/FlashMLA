@@ -1,3 +1,5 @@
+"""Build the selected FlashMLA fork. Packed additions: Author: Winston Cai."""
+
 import os
 from pathlib import Path
 from datetime import datetime
@@ -20,6 +22,8 @@ def get_features_args():
     features_args = []
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if not is_flag_set("FLASH_MLA_DISABLE_SM100"):
+        features_args.append("-DFLASHMLA_ENABLE_SM100")
     return features_args
 
 def get_arch_flags():
@@ -51,100 +55,111 @@ def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
-
 this_dir = os.path.dirname(os.path.abspath(__file__))
+if not (Path(this_dir) / "csrc/cutlass/include/cutlass/bfloat16.h").is_file():
+    raise RuntimeError("CUTLASS is missing; initialize the pinned csrc/cutlass submodule")
 
 if IS_WINDOWS:
     cxx_args = ["/O2", "/std:c++20", "/DNDEBUG", "/W0"]
 else:
     cxx_args = ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
+flashmla_sources = [
+    # API
+    "csrc/api/api.cpp",
+    "csrc/api/sparse_prefill.cpp",
+    "csrc/api/sparse_decode.cpp",
+    "csrc/api/dense_fwd.cpp",
+    "csrc/api/dense_bwd.cpp",
+    "csrc/api/dense_decode.cpp",
+    "csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
+
+    # Misc kernels for decoding
+    "csrc/kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+    "csrc/kernels/smxx/decode/combine/combine.cu",
+
+    # sm90 dense decode
+    "csrc/kernels/sm90/decode/dense/instantiations/fp16.cu",
+    "csrc/kernels/sm90/decode/dense/instantiations/bf16.cu",
+
+    # sm90 sparse decode
+    "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h64.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h128.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h128.cu",
+
+    # sm90 sparse prefill
+    "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu",
+    "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
+    "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu",
+    "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
+
+    # sm100 dense prefill & backward
+    "csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+    "csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+
+    # sm100 sparse prefill
+    "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k576.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu",
+
+    # sm100 fused norm + rope + attn + rope + cast
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_norm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_nonorm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_prefill_norm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_prefill_nonorm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_norm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_nonorm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_norm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_nonorm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_decode_norm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_decode_nonorm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h128_decode_norm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h128_decode_nonorm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_norm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_nonorm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_norm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_nonorm.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
+    "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
+
+    # sm100 sparse decode
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64_no_split.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64_no_split.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64_no_split.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64.cu",
+    "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64_no_split.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_splitkv.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu",
+    "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu",
+]
+if is_flag_set("FLASH_MLA_DISABLE_SM100"):
+    flashmla_sources = [
+        path for path in flashmla_sources
+        if "/sm100/" not in path and Path(path).name not in {
+            "dense_fwd.cpp", "dense_bwd.cpp", "fused_norm_rope_attn_rope_cast_fwd.cpp"
+        }
+    ]
+
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
         name="flash_mla.cuda",
-        sources=[
-            # API
-            "csrc/api/api.cpp",
-            "csrc/api/sparse_prefill.cpp",
-            "csrc/api/sparse_decode.cpp",
-            "csrc/api/dense_fwd.cpp",
-            "csrc/api/dense_bwd.cpp",
-            "csrc/api/dense_decode.cpp",
-            "csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
-
-            # Misc kernels for decoding
-            "csrc/kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
-            "csrc/kernels/smxx/decode/combine/combine.cu",
-
-            # sm90 dense decode
-            "csrc/kernels/sm90/decode/dense/instantiations/fp16.cu",
-            "csrc/kernels/sm90/decode/dense/instantiations/bf16.cu",
-
-            # sm90 sparse decode
-            "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h128.cu",
-
-            # sm90 sparse prefill
-            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu",
-            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
-            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu",
-            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
-
-            # sm100 dense prefill & backward
-            "csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-            "csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-
-            # sm100 sparse prefill
-            "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k576.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu",
-
-            # sm100 fused norm + rope + attn + rope + cast
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_prefill_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_prefill_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h128_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h128_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
-
-            # sm100 sparse decode
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64_no_split.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64_no_split.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64_no_split.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64_no_split.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_splitkv.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu",
-        ],
+        sources=flashmla_sources,
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
             "nvcc": [
