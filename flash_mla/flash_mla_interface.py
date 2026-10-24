@@ -505,11 +505,17 @@ def flash_mla_with_remnant_kvcache(
 
 
 def flash_mla_with_fp4_kvcache(
-    q: torch.Tensor, k_cache: torch.Tensor, indices: torch.Tensor,
-    extra_k_cache: torch.Tensor, extra_indices_in_kvcache: torch.Tensor,
-    *, packed: bool = False, topk_length: Optional[torch.Tensor] = None,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    extra_k_cache: torch.Tensor,
+    extra_indices_in_kvcache: torch.Tensor,
+    *,
+    packed: bool = False,
+    topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-    attn_sink: Optional[torch.Tensor] = None, softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """SM90 Direct over V4 SWA and post-RoPE V4.1 FP4 global pages.
 
@@ -523,6 +529,15 @@ def flash_mla_with_fp4_kvcache(
     """
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
     out, lse, _, _ = flash_mla_cuda.fp4_sparse_decode_fwd(
-        q, k_cache, indices, topk_length, attn_sink, extra_k_cache,
-        extra_indices_in_kvcache, extra_topk_length, packed, scale)
+        q,
+        k_cache,
+        indices,
+        topk_length,
+        attn_sink,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        extra_topk_length,
+        packed,
+        scale,
+    )
     return out, lse
