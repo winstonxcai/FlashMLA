@@ -98,6 +98,8 @@ flashmla_sources = [
 
     # sm90 sparse prefill
     "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu",
+    "csrc/kernels/sm90/prefill/sparse/instantiations/fp4_prefill_k512.cu",
+    "csrc/kernels/sm90/prefill/sparse/instantiations/fp4_prefill_k512_topklen.cu",
     "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
     "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu",
     "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",

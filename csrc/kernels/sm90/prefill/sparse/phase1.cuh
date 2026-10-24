@@ -1,6 +1,8 @@
+// Author: Winston Cai. FP4-only policy preserves stock sparse prefill behavior.
 #pragma once
 
 #include "config.h"
+#include <type_traits>
 
 #include "kernels/utils.h"
 #include "../../helpers.h"
@@ -8,6 +10,19 @@
 namespace sm90::prefill::sparse_fwd {
 
 using namespace cute;
+
+// Author: Winston Cai. Consumer warpgroups can reach the same named barrier
+// through different role branches. FP4 prefill uses CUTLASS's non-aligned
+// instructions; warp participation, resource IDs and phase counts stay intact.
+// The original static policy is retained for every stock instantiation.
+struct FP4PrefillNamedBarrier {
+    CUTLASS_DEVICE static void arrive_and_wait(uint32_t count, uint32_t id) {
+        cutlass::arch::NamedBarrier(count, id).arrive_and_wait_unaligned();
+    }
+    CUTLASS_DEVICE static void arrive(uint32_t count, uint32_t id) {
+        cutlass::arch::NamedBarrier(count, id).arrive_unaligned();
+    }
+};
 
 CUTE_DEVICE void st_global_cs_128(float f0, float f1, float f2, float f3, void *dst_ptr) {
     asm volatile("st.weak.global.cs.v4.f32 [%0], {%1, %2, %3, %4};\n"
@@ -39,10 +54,12 @@ void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes
                      : "memory");
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
+template<int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
 template<typename TMAParams>
-__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+    static_assert(NamedBarriers::epilogue_sync + cutlass::arch::NamedBarrier::ReservedNamedBarrierCount < 16);
+    using NamedBarrier = std::conditional_t<FP4_PREFILL, FP4PrefillNamedBarrier, cutlass::arch::NamedBarrier>;
     const int q_h_idx = blockIdx.x % (params.h_q/B_H);
     const int s_q_idx = blockIdx.x / (params.h_q/B_H);
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
@@ -571,8 +588,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     Kernel::devfunc(params, tma_params);
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
-void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &params) {
+template<int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
+void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::run(const SparseAttnFwdParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
     KU_ASSERT(params.topk > 0);
@@ -620,7 +637,7 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
         shape_Q, tma_Q,
         tensor_map_O
     };
-    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH>, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -638,9 +655,9 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
     KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
+template<int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-    KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(params);
+    KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::run(params);
 }
 
 }
