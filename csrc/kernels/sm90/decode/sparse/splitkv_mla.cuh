@@ -767,10 +767,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
                 Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
 
-                // Diagnostic direct acquire: redundant with WG0's handoff,
-                // but gives racecheck an explicit producer-to-WG1 dependency.
-                if constexpr (WIDE_PRODUCER) {
+                // WG1 consumes KV and later reuses its shared-memory union for
+                // output. Acquire producer completion directly, including the
+                // peer CTA's writes, rather than relying only on WG0's S-ready
+                // handoff to carry the KV lifetime dependency.
+                if constexpr (MODEL_TYPE == ModelType::V4) {
                     plan.bar_k_local_ready[buf_idx].wait((bar_phase_k >> buf_idx) & 1);
+                    if constexpr (CLUSTER_SIZE == 2) {
+                        plan.bar_k_remote_ready[buf_idx].wait((bar_phase_k >> buf_idx) & 1);
+                    }
                     bar_phase_k ^= 1 << buf_idx;
                 }
                 // Wait for S and sScale
