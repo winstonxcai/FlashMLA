@@ -89,6 +89,28 @@ protected:
     }
 };
 
+template<int FORMAT>
+class Decode_Sm90_FP4_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_64, DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_512, DecodeFeatures::V4_KVCACHE_FORMAT,
+        DecodeFeatures::V41_FP4_KVCACHE_FORMAT, DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH, DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH
+    )
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        return {std::max(Arch().num_sms / s_q / (h_q/64), 1), 5, 64};
+    }
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &) override {
+        DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
+            sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<
+                ModelType::V4, NUM_HEADS, false, FORMAT>(params);
+        });
+    }
+};
+
 class Decode_Sm90_Remnant_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
@@ -256,7 +278,7 @@ protected:
 #endif
 
 
-template<bool REMNANT>
+template<bool REMNANT, int EXTRA_FP4 = 0>
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface_impl(
     const at::Tensor &q,   // [b, s_q, h_q, d_qk]
@@ -321,6 +343,7 @@ sparse_attn_decode_interface_impl(
     }
 
     if (have_extra_kcache) {
+        KU_CHECK_NDIM(extra_kv, 4);
         extra_num_blocks = extra_kv->size(0);
         extra_page_block_size = extra_kv->size(1);
     }
@@ -425,7 +448,7 @@ sparse_attn_decode_interface_impl(
         model_type = extra_model_type = ModelType::V32;
     } else if (d_qk == 512 && d_v == 512) {
         model_type = kv_format_hint.value_or(detect_kv_cache_format_for_headdim_512(kv.size(3), kv_format_hint));
-        extra_model_type = have_extra_kcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3), model_type) : model_type;
+        extra_model_type = EXTRA_FP4 != 0 ? ModelType::V41_FP4 : (have_extra_kcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3), model_type) : model_type);
     } else {
         TORCH_CHECK(false, "Unsupported head sizes for is_fp8_kvcache == True");
     }
@@ -434,12 +457,12 @@ sparse_attn_decode_interface_impl(
             " but q/kv have d_qk ", d_qk, " and ", kv.size(3), " bytes per token");
     }
     TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
-    TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
+    TORCH_CHECK((EXTRA_FP4 != 0 && model_type == ModelType::V4 && have_extra_kcache) || is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_cache_bytes_per_token(model_type));
-    KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, kv_cache_bytes_per_token(extra_model_type));
+    KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, (EXTRA_FP4 == 2 ? 224 : kv_cache_bytes_per_token(extra_model_type)));
     TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous when is_fp8_cache is True for kv cache");
     if (have_extra_kcache) {
-        TORCH_CHECK(extra_kv->stride(1) == kv_cache_bytes_per_token(extra_model_type), "The whole block must be contiguous when is_fp8_cache is True for extra kv cache");
+        TORCH_CHECK(extra_kv->stride(1) == (EXTRA_FP4 == 2 ? 224 : kv_cache_bytes_per_token(extra_model_type)), "The whole block must be contiguous when is_fp8_cache is True for extra kv cache");
     }
     KU_CHECK_SHAPE(indices, b, s_q, topk);
     KU_CHECK_SHAPE(topk_length, b);
@@ -501,7 +524,14 @@ sparse_attn_decode_interface_impl(
     }
 
     DecodeImplBase* impl;
-    if constexpr (REMNANT) {
+    if constexpr (EXTRA_FP4 != 0) {
+        TORCH_CHECK(arch.is_sm90a(), "V4.1 FP4 Direct requires SM90a");
+        TORCH_CHECK(model_type == ModelType::V4 && have_extra_kcache, "FP4 Direct requires V4 SWA and a global FP4 cache");
+        TORCH_CHECK(topk % 64 == 0 && extra_topk % 64 == 0, "FP4 Direct index widths must be padded to 64");
+        TORCH_CHECK(extra_page_block_size > 0 && extra_page_block_size % 64 == 0, "FP4 page size must be a positive multiple of 64");
+        TORCH_CHECK(extra_kv->stride(0) >= extra_page_block_size*(EXTRA_FP4 == 2 ? 224 : 288) && extra_kv->stride(0) % 256 == 0, "FP4 page stride must contain its SoA payload/scales and align to 256 bytes");
+        impl = new Decode_Sm90_FP4_Impl<EXTRA_FP4>();
+    } else if constexpr (REMNANT) {
         TORCH_CHECK(arch.is_sm90a(), "Remnant direct decode currently requires SM90a");
         impl = new Decode_Sm90_Remnant_Impl();
     }
@@ -721,8 +751,29 @@ sparse_attn_decode_remnant_interface(
         remnant_raw_indices, remnant_freqs);
 }
 
+// Dedicated opt-in API: never changes stock format inference or FP8 Remnant.
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_fp4_interface(
+    const at::Tensor &q, const at::Tensor &kv, const at::Tensor &indices,
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &attn_sink,
+    const at::Tensor &extra_kv, const at::Tensor &extra_indices,
+    const std::optional<at::Tensor> &extra_topk_length, bool packed, float sm_scale
+) {
+    std::optional<at::Tensor> metadata, splits;
+    if (packed) return sparse_attn_decode_interface_impl<false, 2>(
+        q, kv, indices, topk_length, attn_sink, metadata, splits,
+        extra_kv, extra_indices, extra_topk_length, 512, sm_scale,
+        std::string("V4"), std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+    return sparse_attn_decode_interface_impl<false, 1>(
+        q, kv, indices, topk_length, attn_sink, metadata, splits,
+        extra_kv, extra_indices, extra_topk_length, 512, sm_scale,
+        std::string("V4"), std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+}
+
 #ifndef FLASH_MLA_LIBTORCH_ONLY
 void register_sparse_decode(pybind11::module_& m) {
+    m.def("fp4_sparse_decode_fwd", &sparse_attn_decode_fp4_interface);
     m.def("remnant_sparse_decode_fwd", &sparse_attn_decode_remnant_interface);
     m.def("sparse_decode_fwd",
         &sparse_attn_decode_interface,

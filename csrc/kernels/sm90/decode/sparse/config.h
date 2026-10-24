@@ -26,11 +26,13 @@ struct RemnantScratchStorage<true, NUM_K_BUFS, ROWS, PREFIX_STRIDE> {
     uint8_t scales[NUM_K_BUFS][ROWS * 8];
 };
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false, int EXTRA_FP4 = 0>
 class KernelTemplate {
 public:
 
 static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
+static_assert(EXTRA_FP4 >= 0 && EXTRA_FP4 <= 2);
+static_assert(EXTRA_FP4 == 0 || (MODEL_TYPE == ModelType::V4 && !REMNANT));
 static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
 static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 

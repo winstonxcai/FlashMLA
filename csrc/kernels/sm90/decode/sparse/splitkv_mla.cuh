@@ -433,9 +433,9 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
 template<typename TMAParams>
-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
@@ -951,6 +951,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                         }
                     }
 
+                    if constexpr (EXTRA_FP4 != 0 && IS_EXTRA_BLOCK) {
+                        if (token_index < 0 || token_index >= params.extra_num_blocks * page_block_size)
+                            token_index = -1;
+                    }
                     int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
@@ -959,8 +963,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
 
                     fp8* gK_base = nullptr;
                     bf16 scales[NUM_SCALES];
-                    if constexpr (REMNANT && MODEL_TYPE == ModelType::V4 && IS_EXTRA_BLOCK) {
-                        // Packed rows are expanded below, not loaded from extra_kv.
+                    if constexpr ((REMNANT || EXTRA_FP4 != 0) && MODEL_TYPE == ModelType::V4 && IS_EXTRA_BLOCK) {
+                        // FP4/Packed rows are expanded below, not loaded from extra_kv.
                     } else if constexpr (IS_V32_LIKE) {
                         static_assert(NUM_SCALES == 4);
                         gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride;
@@ -1005,7 +1009,56 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
 
                     // Collectively copy from global memory and dequant
                     // For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
-                    if constexpr (WIDE_PRODUCER && IS_EXTRA_BLOCK) {
+                    if constexpr (EXTRA_FP4 != 0 && IS_EXTRA_BLOCK) {
+                        // Author: Winston Cai. Expand post-RoPE E2M1 into the
+                        // existing BF16 WGMMA layout; SWA and barriers stay V4.
+                        constexpr int DATA_BYTES = EXTRA_FP4 == 2 ? 192 : 256;
+                        const bool valid = token_index >= 0;
+                        const uint8_t* page = reinterpret_cast<const uint8_t*>(k_ptr)
+                            + int64_t(block_index)*k_block_stride;
+                        const uint8_t* data = page + rel_idx_in_block*DATA_BYTES;
+                        const uint8_t* scale_ptr = page + page_block_size*DATA_BYTES + rel_idx_in_block*32;
+                        #pragma unroll
+                        for (int tile = 0; tile < 8; ++tile) {
+                            #pragma unroll
+                            for (int half = 0; half < 2; ++half) {
+                                bf16x8 result;
+                                bf16* components = reinterpret_cast<bf16*>(&result);
+                                #pragma unroll
+                                for (int item = 0; item < 8; ++item) {
+                                    const int coordinate = tile*64 + (lane_idx/8)*16 + half*8 + item;
+                                    int rank = coordinate;
+                                    bool kept = valid;
+                                    if constexpr (EXTRA_FP4 == 2) {
+                                        const uint64_t* bitmap = reinterpret_cast<const uint64_t*>(data+128);
+                                        const int word = coordinate/64;
+                                        const int bit = coordinate%64;
+                                        const uint64_t mask = valid ? __ldg(bitmap+word) : 0;
+                                        kept = valid && ((mask >> (63-bit)) & 1);
+                                        rank = bit == 0 ? 0 : __popcll(mask >> (64-bit));
+                                        #pragma unroll
+                                        for (int w = 0; w < 8; ++w)
+                                            if (w < word && valid) rank += __popcll(__ldg(bitmap+w));
+                                    }
+                                    float value = 0.0f;
+                                    if (kept) {
+                                        const uint8_t byte = __ldg(data+rank/2);
+                                        const int code = (byte >> ((rank%2)*4)) & 15;
+                                        const int mag = code & 7;
+                                        const float magnitude = mag < 4 ? mag*0.5f :
+                                            (mag == 4 ? 2.0f : (mag == 5 ? 3.0f : (mag == 6 ? 4.0f : 6.0f)));
+                                        const fp8 scale = fp8::bitcast(__ldg(scale_ptr+coordinate/16));
+                                        value = (code & 8 ? -magnitude : magnitude) * float(scale);
+                                    }
+                                    components[item] = bf16(value);
+                                }
+                                const int offset = (tile*64+half*8)*TOPK_BLOCK_SIZE;
+                                *reinterpret_cast<uint4*>(sK_nope_base+offset) = *reinterpret_cast<uint4*>(&result);
+                                if constexpr (CLUSTER_SIZE == 2)
+                                    st_async_128b(sK_nope_peer_base+offset, result, peer_bar_k_remote_ready);
+                            }
+                        }
+                    } else if constexpr (WIDE_PRODUCER && IS_EXTRA_BLOCK) {
                         static_assert(!WIDE_PRODUCER || (CLUSTER_SIZE == 1 && TOPK_BLOCK_SIZE == 32));
                         const bool valid = remnant_valid;
                         const int word = lane_idx / 4;
@@ -1245,7 +1298,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::devfunc(const Sp
                         if constexpr (IS_V32_LIKE) {
                             return index != -1;
                         } else {
-                            return index != -1 && rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length;
+                            return index != -1 && (EXTRA_FP4 == 0 || !IS_EXTRA_BLOCK || (index >= 0 && index < params.extra_num_blocks * page_block_size)) && rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length;
                         }
                     };
                     int2 indices = __ldg((int2*)(indices_base + lane_idx*2));
@@ -1297,8 +1350,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     Kernel::devfunc(params, tma_params);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
-void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(const SparseAttnDecodeParams &params) {
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
+void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
     KU_ASSERT(params.d_qk == HEAD_DIM_K);
@@ -1308,7 +1361,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(const SparseAttnDecodeP
         constexpr int BYTES_PER_TOKEN = HEAD_DIM_NOPE + 2*HEAD_DIM_ROPE + 8;
         KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in DeepSeek-V4");  // Each block must be contiguous
         if (params.extra_kv != nullptr) {
-            KU_ASSERT(params.stride_extra_kv_row == BYTES_PER_TOKEN, "Each page block in extra KV cache must be contiguous for head64 sparse fp8 decoding attention in DeepSeek-V4");  // Each block must be contiguous
+            KU_ASSERT(params.stride_extra_kv_row == (EXTRA_FP4 == 2 ? 224 : (EXTRA_FP4 == 1 ? 288 : BYTES_PER_TOKEN)), "Each page block in extra KV cache must be contiguous for head64 sparse fp8 decoding attention in DeepSeek-V4");  // Each block must be contiguous
         }
     } else {
         KU_ASSERT(params.extra_kv == nullptr, "V3.2 does not support extra KV cache");
@@ -1363,7 +1416,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(const SparseAttnDecodeP
         shape_Q, tma_Q,
         tensor_map_o
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>, decltype(tma_params)>;
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1394,9 +1447,9 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(const SparseAttnDecodeP
     KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
 void run_flash_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams &params) {
-    KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT>::run(params);
+    KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(params);
 }
 
 }

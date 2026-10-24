@@ -83,6 +83,10 @@ flashmla_sources = [
     "csrc/kernels/sm90/decode/dense/instantiations/bf16.cu",
 
     # sm90 sparse decode
+    "csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_native_h64.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_native_h128.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_packed_h64.cu",
+    "csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_packed_h128.cu",
     "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu",
     "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu",
     "csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h64.cu",
