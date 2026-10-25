@@ -84,6 +84,76 @@ __device__ __forceinline__ uint2 remnant_window_fp8x8(
     };
 }
 
+// Author: Winston Cai. V4 fragment ranks/permutations, with nibble storage.
+// A nonempty eight-coordinate fragment needs at most eight survivor nibbles.
+// Two aligned eight-byte loads stay within the128-byte payload plus16-byte guard.
+__device__ __forceinline__ uint2 remnant_window_fp4x8(
+    const uint8_t* codes, int rank, uint8_t mask
+) {
+    if (mask == 0) return uint2{0, 0};
+    const uint2* window = reinterpret_cast<const uint2*>(codes + ((rank / 2) & ~7));
+    const uint2 first = window[0], second = window[1];
+    const bool upper = (rank & 8) != 0;
+    const uint32_t word0 = upper ? first.y : first.x;
+    const uint32_t word1 = upper ? second.x : first.y;
+    const uint32_t nibbles = __funnelshift_r(word0, word1, (rank & 7) * 4);
+    uint32_t low = 0, high = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        low |= ((nibbles >> (i * 4)) & 15u) << (i * 8);
+        high |= ((nibbles >> ((i + 4) * 4)) & 15u) << (i * 8);
+    }
+    const uint32_t selectors = remnant_byte_rank_pack(mask);
+    return uint2{
+        remnant_window_fp8x4(low, high, selectors >> 16, mask >> 4),
+        remnant_window_fp8x4(low, high, selectors & 0xffffu, mask & 15u),
+    };
+}
+
+template <typename Plan>
+__device__ __forceinline__ void prepare_fp4_row(
+    Plan& plan, int buf, int row, const uint8_t* data,
+    const uint8_t* scales, bool valid, int lane
+) {
+    // Four lanes eight apart cooperate on one token, as in V4's narrow loader.
+    const int group = lane / 8;
+    uint8_t* staged = plan.fp4.codes[buf] + row * 144;
+    if (valid) {
+        #pragma unroll
+        for (int offset = 0; offset < 32; offset += 16)
+            *reinterpret_cast<uint4*>(staged + group * 32 + offset) =
+                __ldg(reinterpret_cast<const uint4*>(data + group * 32 + offset));
+    }
+    if (group == 0) {
+        auto* bitmap = plan.fp4.bitmaps[buf] + row * 8;
+        auto* prefix = plan.fp4.prefixes[buf] + row * 9;
+        auto* scale = plan.fp4.scales[buf] + row * 32;
+        prefix[0] = 0;
+        #pragma unroll
+        for (int word = 0; word < 8; ++word) {
+            const uint64_t bits = valid ? __ldg(reinterpret_cast<const uint64_t*>(data + 128) + word) : 0;
+            bitmap[word] = bits;
+            prefix[word + 1] = prefix[word] + __popcll(bits);
+        }
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) scale[i] = valid ? __ldg(scales + i) : 0;
+        *reinterpret_cast<uint4*>(staged + 128) = uint4{0, 0, 0, 0};
+    }
+    __syncwarp();
+}
+
+template <typename Plan>
+__device__ __forceinline__ uint2 load_fp4_fragment(
+    const Plan& plan, int buf, int row, int coordinate
+) {
+    const int word = coordinate / 64, bit = coordinate % 64;
+    const uint64_t keep = plan.fp4.bitmaps[buf][row * 8 + word];
+    const uint8_t mask = uint8_t(keep >> (56 - bit));
+    const uint64_t prior = bit == 0 ? 0ULL : (~0ULL << (64 - bit));
+    const int rank = plan.fp4.prefixes[buf][row * 9 + word] + __popcll(keep & prior);
+    return remnant_window_fp4x8(plan.fp4.codes[buf] + row * 144, rank, mask);
+}
+
 // Keep the survivor window in named registers.  Indexing a byte through an
 // address-taken uint4 array makes nvcc materialize that array in thread-local
 // memory, adding an LDL/STL pair for every reconstructed fragment.
@@ -1018,36 +1088,43 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfu
                             + int64_t(block_index)*k_block_stride;
                         const uint8_t* data = page + rel_idx_in_block*DATA_BYTES;
                         const uint8_t* scale_ptr = page + page_block_size*DATA_BYTES + rel_idx_in_block*32;
+                        if constexpr (EXTRA_FP4 == 2)
+                            prepare_fp4_row(plan, buf_idx, remnant_row_slot, data, scale_ptr, valid, lane_idx);
                         #pragma unroll
                         for (int tile = 0; tile < 8; ++tile) {
                             #pragma unroll
                             for (int half = 0; half < 2; ++half) {
                                 bf16x8 result;
                                 bf16* components = reinterpret_cast<bf16*>(&result);
+                                const int coordinate_base = tile*64 + (lane_idx/8)*16 + half*8;
+                                uint2 fragment{0, 0};
+                                uint8_t keep_mask = 0xff;
+                                if constexpr (EXTRA_FP4 == 2) {
+                                    fragment = load_fp4_fragment(plan, buf_idx, remnant_row_slot, coordinate_base);
+                                    const uint64_t keep = plan.fp4.bitmaps[buf_idx][remnant_row_slot*8 + coordinate_base/64];
+                                    keep_mask = uint8_t(keep >> (56 - coordinate_base%64));
+                                }
                                 #pragma unroll
                                 for (int item = 0; item < 8; ++item) {
-                                    const int coordinate = tile*64 + (lane_idx/8)*16 + half*8 + item;
-                                    int rank = coordinate;
-                                    bool kept = valid;
+                                    const int coordinate = coordinate_base + item;
+                                    int code = 0;
                                     if constexpr (EXTRA_FP4 == 2) {
-                                        const uint64_t* bitmap = reinterpret_cast<const uint64_t*>(data+128);
-                                        const int word = coordinate/64;
-                                        const int bit = coordinate%64;
-                                        const uint64_t mask = valid ? __ldg(bitmap+word) : 0;
-                                        kept = valid && ((mask >> (63-bit)) & 1);
-                                        rank = bit == 0 ? 0 : __popcll(mask >> (64-bit));
-                                        #pragma unroll
-                                        for (int w = 0; w < 8; ++w)
-                                            if (w < word && valid) rank += __popcll(__ldg(bitmap+w));
+                                        const uint32_t word = item < 4 ? fragment.x : fragment.y;
+                                        code = (word >> ((item & 3)*8)) & 15;
+                                    } else if (valid) {
+                                        const uint8_t byte = __ldg(data+coordinate/2);
+                                        code = (byte >> ((coordinate%2)*4)) & 15;
                                     }
                                     float value = 0.0f;
-                                    if (kept) {
-                                        const uint8_t byte = __ldg(data+rank/2);
-                                        const int code = (byte >> ((rank%2)*4)) & 15;
+                                    if (valid && ((keep_mask >> (7-item)) & 1)) {
                                         const int mag = code & 7;
                                         const float magnitude = mag < 4 ? mag*0.5f :
                                             (mag == 4 ? 2.0f : (mag == 5 ? 3.0f : (mag == 6 ? 4.0f : 6.0f)));
-                                        const fp8 scale = fp8::bitcast(__ldg(scale_ptr+coordinate/16));
+                                        uint8_t scale_code;
+                                        if constexpr (EXTRA_FP4 == 2)
+                                            scale_code = plan.fp4.scales[buf_idx][remnant_row_slot*32+coordinate/16];
+                                        else scale_code = __ldg(scale_ptr+coordinate/16);
+                                        const fp8 scale = fp8::bitcast(scale_code);
                                         value = (code & 8 ? -magnitude : magnitude) * float(scale);
                                     }
                                     components[item] = bf16(value);
@@ -1058,6 +1135,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfu
                                     st_async_128b(sK_nope_peer_base+offset, result, peer_bar_k_remote_ready);
                             }
                         }
+                        // All cooperating lanes finish reads before the next producer
+                        // round can reuse these scratch rows (not the WGMMA buffer).
+                        if constexpr (EXTRA_FP4 == 2) __syncwarp();
                     } else if constexpr (WIDE_PRODUCER && IS_EXTRA_BLOCK) {
                         static_assert(!WIDE_PRODUCER || (CLUSTER_SIZE == 1 && TOPK_BLOCK_SIZE == 32));
                         const bool valid = remnant_valid;

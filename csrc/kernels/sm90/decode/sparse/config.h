@@ -26,6 +26,18 @@ struct RemnantScratchStorage<true, NUM_K_BUFS, ROWS, PREFIX_STRIDE> {
     uint8_t scales[NUM_K_BUFS][ROWS * 8];
 };
 
+// Author: Winston Cai. Transient staging only; persistent Packed FP4 stays224 B.
+template <bool ENABLED, int BUFS, int ROWS>
+struct FP4ScratchStorage {};
+
+template <int BUFS, int ROWS>
+struct FP4ScratchStorage<true, BUFS, ROWS> {
+    CUTE_ALIGNAS(16) uint8_t codes[BUFS][ROWS * 144]; //128 payload +16 zero guard
+    CUTE_ALIGNAS(8) uint64_t bitmaps[BUFS][ROWS * 8];
+    uint16_t prefixes[BUFS][ROWS * 9];
+    uint8_t scales[BUFS][ROWS * 32];
+};
+
 template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false, int EXTRA_FP4 = 0>
 class KernelTemplate {
 public:
@@ -127,6 +139,7 @@ struct SharedMemoryPlan {
     // This storage is present only in Remnant instantiations. Native keeps
     // the stock shared-memory footprint and occupancy constraints.
     RemnantScratchStorage<REMNANT, NUM_K_BUFS, REMNANT_ROWS, REMNANT_PREFIX_STRIDE> remnant;
+    FP4ScratchStorage<EXTRA_FP4 == 2, NUM_K_BUFS, REMNANT_ROWS> fp4;
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
 };
 
