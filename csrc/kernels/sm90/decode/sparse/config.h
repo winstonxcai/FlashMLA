@@ -9,6 +9,7 @@
 #include <kerutils/kerutils.cuh>
 
 #include "kernels/defines.h"
+#include "kernels/kv_cache_format.h"
 #include "kernels/params.h"
 
 using namespace cute;
@@ -26,11 +27,29 @@ struct RemnantScratchStorage<true, NUM_K_BUFS, ROWS, PREFIX_STRIDE> {
     uint8_t scales[NUM_K_BUFS][ROWS * 8];
 };
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false>
+// Author: Winston Cai. Transient staging only; persistent Packed FP4 stays224
+// B.
+template <bool ENABLED, int BUFS, int ROWS> struct FP4ScratchStorage {};
+
+template <int BUFS, int ROWS> struct FP4ScratchStorage<true, BUFS, ROWS> {
+  CUTE_ALIGNAS(16)
+  uint8_t
+      codes[BUFS]
+           [ROWS * PackedFP4CacheFormat::GUARDED_VALUE_BYTES]; // 128 payload
+                                                               // +16 zero guard
+  CUTE_ALIGNAS(8) uint64_t bitmaps[BUFS][ROWS * 8];
+  uint16_t prefixes[BUFS][ROWS * PackedFP4CacheFormat::PREFIX_COUNT];
+  uint8_t scales[BUFS][ROWS * PackedFP4CacheFormat::SCALE_BYTES];
+};
+
+template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false,
+          int EXTRA_FP4 = 0>
 class KernelTemplate {
 public:
 
 static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
+static_assert(EXTRA_FP4 >= 0 && EXTRA_FP4 <= 2);
+static_assert(EXTRA_FP4 == 0 || (MODEL_TYPE == ModelType::V4 && !REMNANT));
 static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
 static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
@@ -125,6 +144,7 @@ struct SharedMemoryPlan {
     // This storage is present only in Remnant instantiations. Native keeps
     // the stock shared-memory footprint and occupancy constraints.
     RemnantScratchStorage<REMNANT, NUM_K_BUFS, REMNANT_ROWS, REMNANT_PREFIX_STRIDE> remnant;
+    FP4ScratchStorage<EXTRA_FP4 == 2, NUM_K_BUFS, REMNANT_ROWS> fp4;
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
 };
 
@@ -336,7 +356,5 @@ static __device__ __forceinline__ void
 devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params);
 
 static void run(const SparseAttnDecodeParams &params);
-
 };
-
 }

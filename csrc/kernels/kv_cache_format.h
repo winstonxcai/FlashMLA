@@ -33,6 +33,25 @@ struct KVCacheFormat {
     static constexpr int BYTES_PER_TOKEN = TMA_K_STRIDE + (IS_V32 ? 0 : NUM_SCALES_EACH_TOKEN * SCALE_BYTES);
 };
 
+// Author: Winston Cai. Persistent Packed FP4 shares Native's quantization;
+// only coordinate storage differs. The SoA scale plane follows all data rows.
+struct PackedFP4CacheFormat {
+  using Native = KVCacheFormat<ModelType::V41_FP4>;
+  static constexpr int HEAD_DIM = Native::D_QK;
+  static constexpr int SURVIVORS = HEAD_DIM / 2;
+  static constexpr int VALUE_BYTES = SURVIVORS / 2;
+  static constexpr int BITMAP_WORDS = HEAD_DIM / 64;
+  static constexpr int BITMAP_BYTES = BITMAP_WORDS * sizeof(uint64_t);
+  static constexpr int DATA_BYTES = VALUE_BYTES + BITMAP_BYTES;
+  static constexpr int SCALE_BYTES = Native::NUM_SCALES_EACH_TOKEN;
+  static constexpr int BYTES_PER_TOKEN = DATA_BYTES + SCALE_BYTES;
+  static constexpr int ALIGNMENT = 16;
+  static constexpr int GUARDED_VALUE_BYTES = VALUE_BYTES + ALIGNMENT;
+  static constexpr int PREFIX_COUNT = BITMAP_WORDS + 1;
+};
+static_assert(KVCacheFormat<ModelType::V41_FP4>::BYTES_PER_TOKEN == 288);
+static_assert(PackedFP4CacheFormat::BYTES_PER_TOKEN == 224);
+
 // Runtime counterpart of KVCacheFormat<MT>::BYTES_PER_TOKEN
 constexpr int kv_cache_bytes_per_token(ModelType mt) {
     switch (mt) {
