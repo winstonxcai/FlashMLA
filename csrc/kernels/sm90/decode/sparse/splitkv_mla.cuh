@@ -518,10 +518,11 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
-template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
+template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT,
+          FP4DecodeMode FP4_MODE>
 template <typename TMAParams>
 __device__ void
-KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
+KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, FP4_MODE>::devfunc(
     const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
@@ -1038,7 +1039,8 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
                         }
                     }
 
-                    if constexpr (EXTRA_FP4 != 0 && IS_EXTRA_BLOCK) {
+                    if constexpr (FP4_MODE != FP4DecodeMode::Stock &&
+                                  IS_EXTRA_BLOCK) {
                       if (token_index < 0 ||
                           token_index >=
                               params.extra_num_blocks * page_block_size)
@@ -1052,7 +1054,8 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
 
                     fp8* gK_base = nullptr;
                     bf16 scales[NUM_SCALES];
-                    if constexpr ((REMNANT || EXTRA_FP4 != 0) &&
+                    if constexpr ((REMNANT ||
+                                   FP4_MODE != FP4DecodeMode::Stock) &&
                                   MODEL_TYPE == ModelType::V4 &&
                                   IS_EXTRA_BLOCK) {
                       // FP4/Packed rows are expanded below, not loaded from
@@ -1117,11 +1120,12 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
 
                     // Collectively copy from global memory and dequant
                     // For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
-                    if constexpr (EXTRA_FP4 != 0 && IS_EXTRA_BLOCK) {
+                    if constexpr (FP4_MODE != FP4DecodeMode::Stock &&
+                                  IS_EXTRA_BLOCK) {
                       // Author: Winston Cai. Expand post-RoPE E2M1 into the
                       // existing BF16 WGMMA layout; SWA and barriers stay V4.
                       constexpr int DATA_BYTES =
-                          EXTRA_FP4 == 2
+                          FP4_MODE == FP4DecodeMode::Packed
                               ? PackedFP4CacheFormat::DATA_BYTES
                               : KVCacheFormat<ModelType::V41_FP4>::QUANT_BYTES;
                       const bool valid = token_index >= 0;
@@ -1133,7 +1137,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
                       const uint8_t *scale_ptr = page +
                                                  page_block_size * DATA_BYTES +
                                                  rel_idx_in_block * 32;
-                      if constexpr (EXTRA_FP4 == 2)
+                      if constexpr (FP4_MODE == FP4DecodeMode::Packed)
                         prepare_fp4_row(plan, buf_idx, remnant_row_slot, data,
                                         scale_ptr, valid, lane_idx);
 #pragma unroll
@@ -1146,7 +1150,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
                               tile * 64 + (lane_idx / 8) * 16 + half * 8;
                           uint2 fragment{0, 0};
                           uint8_t keep_mask = 0xff;
-                          if constexpr (EXTRA_FP4 == 2) {
+                          if constexpr (FP4_MODE == FP4DecodeMode::Packed) {
                             fragment = load_fp4_fragment(plan, buf_idx,
                                                          remnant_row_slot,
                                                          coordinate_base);
@@ -1163,7 +1167,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
                           for (int item = 0; item < 8; ++item) {
                             const int coordinate = coordinate_base + item;
                             int code = 0;
-                            if constexpr (EXTRA_FP4 == 2) {
+                            if constexpr (FP4_MODE == FP4DecodeMode::Packed) {
                               const uint32_t word =
                                   item < 4 ? fragment.x : fragment.y;
                               code = (word >> ((item & 3) * 8)) & 15;
@@ -1183,7 +1187,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
                                                          : (mag == 6 ? 4.0f
                                                                      : 6.0f)));
                               uint8_t scale_code;
-                              if constexpr (EXTRA_FP4 == 2)
+                              if constexpr (FP4_MODE == FP4DecodeMode::Packed)
                                 scale_code =
                                     plan.fp4.scales
                                         [buf_idx]
@@ -1210,7 +1214,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
                       // All cooperating lanes finish reads before the next
                       // producer round can reuse these scratch rows (not the
                       // WGMMA buffer).
-                      if constexpr (EXTRA_FP4 == 2)
+                      if constexpr (FP4_MODE == FP4DecodeMode::Packed)
                         __syncwarp();
                     } else if constexpr (WIDE_PRODUCER && IS_EXTRA_BLOCK) {
                       static_assert(!WIDE_PRODUCER || (CLUSTER_SIZE == 1 &&
@@ -1530,7 +1534,8 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
                             return index != -1;
                         } else {
                           return index != -1 &&
-                                 (EXTRA_FP4 == 0 || !IS_EXTRA_BLOCK ||
+                                 (FP4_MODE == FP4DecodeMode::Stock ||
+                                  !IS_EXTRA_BLOCK ||
                                   (index >= 0 &&
                                    index < params.extra_num_blocks *
                                                page_block_size)) &&
@@ -1587,8 +1592,9 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     Kernel::devfunc(params, tma_params);
 }
 
-template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
-void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(
+template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT,
+          FP4DecodeMode FP4_MODE>
+void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, FP4_MODE>::run(
     const SparseAttnDecodeParams &params) {
   KU_ASSERT(params.h_kv == 1);
   KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
@@ -1604,9 +1610,9 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(
     if (params.extra_kv != nullptr) {
       KU_ASSERT(
           params.stride_extra_kv_row ==
-              (EXTRA_FP4 == 2
+              (FP4_MODE == FP4DecodeMode::Packed
                    ? PackedFP4CacheFormat::BYTES_PER_TOKEN
-                   : (EXTRA_FP4 == 1
+                   : (FP4_MODE == FP4DecodeMode::Native
                           ? KVCacheFormat<ModelType::V41_FP4>::BYTES_PER_TOKEN
                           : BYTES_PER_TOKEN)),
           "Each page block in extra KV cache must be contiguous for head64 "
@@ -1662,7 +1668,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(
   TmaParams<decltype(shape_Q), decltype(tma_Q)> tma_params = {shape_Q, tma_Q,
                                                               tensor_map_o};
   auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<
-      KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>,
+      KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, FP4_MODE>,
       decltype(tma_params)>;
 
   constexpr size_t smem_size = sizeof(SharedMemoryPlan);
@@ -1692,9 +1698,10 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(
   KU_CHECK_KERNEL_LAUNCH();
 }
 
-template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
+template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT,
+          FP4DecodeMode FP4_MODE>
 void run_flash_splitkv_mla_fp8_sparse_kernel(
     const SparseAttnDecodeParams &params) {
-  KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(params);
+  KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, FP4_MODE>::run(params);
 }
 }

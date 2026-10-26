@@ -43,13 +43,16 @@ template <int BUFS, int ROWS> struct FP4ScratchStorage<true, BUFS, ROWS> {
 };
 
 template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false,
-          int EXTRA_FP4 = 0>
+          FP4DecodeMode FP4_MODE = FP4DecodeMode::Stock>
 class KernelTemplate {
 public:
 
 static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
-static_assert(EXTRA_FP4 >= 0 && EXTRA_FP4 <= 2);
-static_assert(EXTRA_FP4 == 0 || (MODEL_TYPE == ModelType::V4 && !REMNANT));
+static_assert(FP4_MODE == FP4DecodeMode::Stock ||
+              FP4_MODE == FP4DecodeMode::Native ||
+              FP4_MODE == FP4DecodeMode::Packed);
+static_assert(FP4_MODE == FP4DecodeMode::Stock ||
+              (MODEL_TYPE == ModelType::V4 && !REMNANT));
 static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
 static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
@@ -144,7 +147,8 @@ struct SharedMemoryPlan {
     // This storage is present only in Remnant instantiations. Native keeps
     // the stock shared-memory footprint and occupancy constraints.
     RemnantScratchStorage<REMNANT, NUM_K_BUFS, REMNANT_ROWS, REMNANT_PREFIX_STRIDE> remnant;
-    FP4ScratchStorage<EXTRA_FP4 == 2, NUM_K_BUFS, REMNANT_ROWS> fp4;
+    FP4ScratchStorage<FP4_MODE == FP4DecodeMode::Packed, NUM_K_BUFS,
+                      REMNANT_ROWS> fp4;
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
 };
 

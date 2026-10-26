@@ -2,6 +2,10 @@
 
 #include "params.h"
 
+// Author: Winston Cai. Native/Packed opt into SM90 FP4; Stock keeps existing
+// dispatch, including the upstream SM100 formats.
+enum class FP4DecodeMode { Stock, Native, Packed };
+
 // Layout of paged quantized KV cache. A page block holds page_block_size tokens as two byte arrays, one row per token:
 //   [page_block_size, TMA_K_STRIDE]                        token data: D_FP4 / 2 + D_FP8 bytes of quantized values,
 //                                                          then the D_BF16 bf16 (RoPE) values of V3.2 / V4
