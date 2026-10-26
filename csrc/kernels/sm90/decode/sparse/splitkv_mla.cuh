@@ -86,72 +86,87 @@ __device__ __forceinline__ uint2 remnant_window_fp8x8(
 
 // Author: Winston Cai. V4 fragment ranks/permutations, with nibble storage.
 // A nonempty eight-coordinate fragment needs at most eight survivor nibbles.
-// Two aligned eight-byte loads stay within the128-byte payload plus16-byte guard.
-__device__ __forceinline__ uint2 remnant_window_fp4x8(
-    const uint8_t* codes, int rank, uint8_t mask
-) {
-    if (mask == 0) return uint2{0, 0};
-    const uint2* window = reinterpret_cast<const uint2*>(codes + ((rank / 2) & ~7));
-    const uint2 first = window[0], second = window[1];
-    const bool upper = (rank & 8) != 0;
-    const uint32_t word0 = upper ? first.y : first.x;
-    const uint32_t word1 = upper ? second.x : first.y;
-    const uint32_t nibbles = __funnelshift_r(word0, word1, (rank & 7) * 4);
-    uint32_t low = 0, high = 0;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        low |= ((nibbles >> (i * 4)) & 15u) << (i * 8);
-        high |= ((nibbles >> ((i + 4) * 4)) & 15u) << (i * 8);
-    }
-    const uint32_t selectors = remnant_byte_rank_pack(mask);
-    return uint2{
-        remnant_window_fp8x4(low, high, selectors >> 16, mask >> 4),
-        remnant_window_fp8x4(low, high, selectors & 0xffffu, mask & 15u),
-    };
+// Two aligned eight-byte loads stay within the128-byte payload plus16-byte
+// guard.
+__device__ __forceinline__ uint2 remnant_window_fp4x8(const uint8_t *codes,
+                                                      int rank, uint8_t mask) {
+  if (mask == 0)
+    return uint2{0, 0};
+  const uint2 *window =
+      reinterpret_cast<const uint2 *>(codes + ((rank / 2) & ~7));
+  const uint2 first = window[0], second = window[1];
+  const bool upper = (rank & 8) != 0;
+  const uint32_t word0 = upper ? first.y : first.x;
+  const uint32_t word1 = upper ? second.x : first.y;
+  const uint32_t nibbles = __funnelshift_r(word0, word1, (rank & 7) * 4);
+  uint32_t low = 0, high = 0;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    low |= ((nibbles >> (i * 4)) & 15u) << (i * 8);
+    high |= ((nibbles >> ((i + 4) * 4)) & 15u) << (i * 8);
+  }
+  const uint32_t selectors = remnant_byte_rank_pack(mask);
+  return uint2{
+      remnant_window_fp8x4(low, high, selectors >> 16, mask >> 4),
+      remnant_window_fp8x4(low, high, selectors & 0xffffu, mask & 15u),
+  };
 }
 
 template <typename Plan>
-__device__ __forceinline__ void prepare_fp4_row(
-    Plan& plan, int buf, int row, const uint8_t* data,
-    const uint8_t* scales, bool valid, int lane
-) {
-    // Four lanes eight apart cooperate on one token, as in V4's narrow loader.
-    const int group = lane / 8;
-    uint8_t* staged = plan.fp4.codes[buf] + row * 144;
-    if (valid) {
-        #pragma unroll
-        for (int offset = 0; offset < 32; offset += 16)
-            *reinterpret_cast<uint4*>(staged + group * 32 + offset) =
-                __ldg(reinterpret_cast<const uint4*>(data + group * 32 + offset));
+__device__ __forceinline__ void
+prepare_fp4_row(Plan &plan, int buf, int row, const uint8_t *data,
+                const uint8_t *scales, bool valid, int lane) {
+  // Four lanes eight apart cooperate on one token, as in V4's narrow loader.
+  const int group = lane / 8;
+  uint8_t *staged =
+      plan.fp4.codes[buf] + row * PackedFP4CacheFormat::GUARDED_VALUE_BYTES;
+  if (valid) {
+#pragma unroll
+    for (int offset = 0; offset < 32; offset += 16)
+      *reinterpret_cast<uint4 *>(staged + group * 32 + offset) =
+          __ldg(reinterpret_cast<const uint4 *>(data + group * 32 + offset));
+  }
+  if (group == 0) {
+    auto *bitmap =
+        plan.fp4.bitmaps[buf] + row * PackedFP4CacheFormat::BITMAP_WORDS;
+    auto *prefix =
+        plan.fp4.prefixes[buf] + row * PackedFP4CacheFormat::PREFIX_COUNT;
+    auto *scale =
+        plan.fp4.scales[buf] + row * PackedFP4CacheFormat::SCALE_BYTES;
+    prefix[0] = 0;
+#pragma unroll
+    for (int word = 0; word < 8; ++word) {
+      const uint64_t bits =
+          valid ? __ldg(reinterpret_cast<const uint64_t *>(
+                            data + PackedFP4CacheFormat::VALUE_BYTES) +
+                        word)
+                : 0;
+      bitmap[word] = bits;
+      prefix[word + 1] = prefix[word] + __popcll(bits);
     }
-    if (group == 0) {
-        auto* bitmap = plan.fp4.bitmaps[buf] + row * 8;
-        auto* prefix = plan.fp4.prefixes[buf] + row * 9;
-        auto* scale = plan.fp4.scales[buf] + row * 32;
-        prefix[0] = 0;
-        #pragma unroll
-        for (int word = 0; word < 8; ++word) {
-            const uint64_t bits = valid ? __ldg(reinterpret_cast<const uint64_t*>(data + 128) + word) : 0;
-            bitmap[word] = bits;
-            prefix[word + 1] = prefix[word] + __popcll(bits);
-        }
-        #pragma unroll
-        for (int i = 0; i < 32; ++i) scale[i] = valid ? __ldg(scales + i) : 0;
-        *reinterpret_cast<uint4*>(staged + 128) = uint4{0, 0, 0, 0};
-    }
-    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < 32; ++i)
+      scale[i] = valid ? __ldg(scales + i) : 0;
+    *reinterpret_cast<uint4 *>(staged + PackedFP4CacheFormat::VALUE_BYTES) =
+        uint4{0, 0, 0, 0};
+  }
+  __syncwarp();
 }
 
 template <typename Plan>
-__device__ __forceinline__ uint2 load_fp4_fragment(
-    const Plan& plan, int buf, int row, int coordinate
-) {
-    const int word = coordinate / 64, bit = coordinate % 64;
-    const uint64_t keep = plan.fp4.bitmaps[buf][row * 8 + word];
-    const uint8_t mask = uint8_t(keep >> (56 - bit));
-    const uint64_t prior = bit == 0 ? 0ULL : (~0ULL << (64 - bit));
-    const int rank = plan.fp4.prefixes[buf][row * 9 + word] + __popcll(keep & prior);
-    return remnant_window_fp4x8(plan.fp4.codes[buf] + row * 144, rank, mask);
+__device__ __forceinline__ uint2 load_fp4_fragment(const Plan &plan, int buf,
+                                                   int row, int coordinate) {
+  const int word = coordinate / 64, bit = coordinate % 64;
+  const uint64_t keep =
+      plan.fp4.bitmaps[buf][row * PackedFP4CacheFormat::BITMAP_WORDS + word];
+  const uint8_t mask = uint8_t(keep >> (56 - bit));
+  const uint64_t prior = bit == 0 ? 0ULL : (~0ULL << (64 - bit));
+  const int rank =
+      plan.fp4.prefixes[buf][row * PackedFP4CacheFormat::PREFIX_COUNT + word] +
+      __popcll(keep & prior);
+  return remnant_window_fp4x8(
+      plan.fp4.codes[buf] + row * PackedFP4CacheFormat::GUARDED_VALUE_BYTES,
+      rank, mask);
 }
 
 // Keep the survivor window in named registers.  Indexing a byte through an
@@ -503,9 +518,11 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
-template<typename TMAParams>
-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
+template <typename TMAParams>
+__device__ void
+KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfunc(
+    const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
@@ -1022,8 +1039,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfu
                     }
 
                     if constexpr (EXTRA_FP4 != 0 && IS_EXTRA_BLOCK) {
-                        if (token_index < 0 || token_index >= params.extra_num_blocks * page_block_size)
-                            token_index = -1;
+                      if (token_index < 0 ||
+                          token_index >=
+                              params.extra_num_blocks * page_block_size)
+                        token_index = -1;
                     }
                     int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
@@ -1033,27 +1052,46 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfu
 
                     fp8* gK_base = nullptr;
                     bf16 scales[NUM_SCALES];
-                    if constexpr ((REMNANT || EXTRA_FP4 != 0) && MODEL_TYPE == ModelType::V4 && IS_EXTRA_BLOCK) {
-                        // FP4/Packed rows are expanded below, not loaded from extra_kv.
+                    if constexpr ((REMNANT || EXTRA_FP4 != 0) &&
+                                  MODEL_TYPE == ModelType::V4 &&
+                                  IS_EXTRA_BLOCK) {
+                      // FP4/Packed rows are expanded below, not loaded from
+                      // extra_kv.
                     } else if constexpr (IS_V32_LIKE) {
-                        static_assert(NUM_SCALES == 4);
-                        gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride;
-                        float scales_float[NUM_SCALES];
-                        *(float4*)(scales_float) = load_128b_from_gmem<float4, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>((float*)(gK_base+HEAD_DIM_NOPE));
-                        CUTE_UNROLL
-                        for (int i = 0; i < NUM_SCALES; ++i) {
-                            scales[i] = (bf16)scales_float[i];
-                        }
+                      static_assert(NUM_SCALES == 4);
+                      gK_base = k_ptr + block_index * k_block_stride +
+                                rel_idx_in_block * k_row_stride;
+                      float scales_float[NUM_SCALES];
+                      *(float4 *)(scales_float) =
+                          load_128b_from_gmem<float4, L1CacheHint::EVICT_LAST,
+                                              L2PrefetchHint::B128>(
+                              (float *)(gK_base + HEAD_DIM_NOPE));
+                      CUTE_UNROLL
+                      for (int i = 0; i < NUM_SCALES; ++i) {
+                        scales[i] = (bf16)scales_float[i];
+                      }
                     } else {
-                        static_assert(NUM_SCALES == 8);
-                        gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*(HEAD_DIM_NOPE + HEAD_DIM_ROPE*sizeof(bf16));
-                        fp8_e8m0* gK_scales_base = (fp8_e8m0*)(k_ptr + block_index*k_block_stride + page_block_size*(HEAD_DIM_NOPE+HEAD_DIM_ROPE*sizeof(bf16)) + rel_idx_in_block*NUM_SCALES*sizeof(fp8_e8m0));
-                        fp8_e8m0 scales_e8m0[NUM_SCALES];
-                        *(int64_t*)scales_e8m0 = __ldg((int64_t*)gK_scales_base);
-                        CUTE_UNROLL
-                        for (int i = 0; i < NUM_SCALES; i += 2) {
-                            *(__nv_bfloat162_raw*)(scales+i) = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(scales_e8m0+i));
-                        }
+                      static_assert(NUM_SCALES == 8);
+                      gK_base =
+                          k_ptr + block_index * k_block_stride +
+                          rel_idx_in_block *
+                              (HEAD_DIM_NOPE + HEAD_DIM_ROPE * sizeof(bf16));
+                      fp8_e8m0 *gK_scales_base =
+                          (fp8_e8m0 *)(k_ptr + block_index * k_block_stride +
+                                       page_block_size *
+                                           (HEAD_DIM_NOPE +
+                                            HEAD_DIM_ROPE * sizeof(bf16)) +
+                                       rel_idx_in_block * NUM_SCALES *
+                                           sizeof(fp8_e8m0));
+                      fp8_e8m0 scales_e8m0[NUM_SCALES];
+                      *(int64_t *)scales_e8m0 =
+                          __ldg((int64_t *)gK_scales_base);
+                      CUTE_UNROLL
+                      for (int i = 0; i < NUM_SCALES; i += 2) {
+                        *(__nv_bfloat162_raw *)(scales + i) =
+                            __nv_cvt_e8m0x2_to_bf162raw(
+                                *(__nv_fp8x2_storage_t *)(scales_e8m0 + i));
+                      }
                     }
 
                     // Wait for the nope buffer to be available
@@ -1080,248 +1118,361 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfu
                     // Collectively copy from global memory and dequant
                     // For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
                     if constexpr (EXTRA_FP4 != 0 && IS_EXTRA_BLOCK) {
-                        // Author: Winston Cai. Expand post-RoPE E2M1 into the
-                        // existing BF16 WGMMA layout; SWA and barriers stay V4.
-                        constexpr int DATA_BYTES = EXTRA_FP4 == 2 ? 192 : 256;
-                        const bool valid = token_index >= 0;
-                        const uint8_t* page = reinterpret_cast<const uint8_t*>(k_ptr)
-                            + int64_t(block_index)*k_block_stride;
-                        const uint8_t* data = page + rel_idx_in_block*DATA_BYTES;
-                        const uint8_t* scale_ptr = page + page_block_size*DATA_BYTES + rel_idx_in_block*32;
-                        if constexpr (EXTRA_FP4 == 2)
-                            prepare_fp4_row(plan, buf_idx, remnant_row_slot, data, scale_ptr, valid, lane_idx);
-                        #pragma unroll
-                        for (int tile = 0; tile < 8; ++tile) {
-                            #pragma unroll
-                            for (int half = 0; half < 2; ++half) {
-                                bf16x8 result;
-                                bf16* components = reinterpret_cast<bf16*>(&result);
-                                const int coordinate_base = tile*64 + (lane_idx/8)*16 + half*8;
-                                uint2 fragment{0, 0};
-                                uint8_t keep_mask = 0xff;
-                                if constexpr (EXTRA_FP4 == 2) {
-                                    fragment = load_fp4_fragment(plan, buf_idx, remnant_row_slot, coordinate_base);
-                                    const uint64_t keep = plan.fp4.bitmaps[buf_idx][remnant_row_slot*8 + coordinate_base/64];
-                                    keep_mask = uint8_t(keep >> (56 - coordinate_base%64));
-                                }
-                                #pragma unroll
-                                for (int item = 0; item < 8; ++item) {
-                                    const int coordinate = coordinate_base + item;
-                                    int code = 0;
-                                    if constexpr (EXTRA_FP4 == 2) {
-                                        const uint32_t word = item < 4 ? fragment.x : fragment.y;
-                                        code = (word >> ((item & 3)*8)) & 15;
-                                    } else if (valid) {
-                                        const uint8_t byte = __ldg(data+coordinate/2);
-                                        code = (byte >> ((coordinate%2)*4)) & 15;
-                                    }
-                                    float value = 0.0f;
-                                    if (valid && ((keep_mask >> (7-item)) & 1)) {
-                                        const int mag = code & 7;
-                                        const float magnitude = mag < 4 ? mag*0.5f :
-                                            (mag == 4 ? 2.0f : (mag == 5 ? 3.0f : (mag == 6 ? 4.0f : 6.0f)));
-                                        uint8_t scale_code;
-                                        if constexpr (EXTRA_FP4 == 2)
-                                            scale_code = plan.fp4.scales[buf_idx][remnant_row_slot*32+coordinate/16];
-                                        else scale_code = __ldg(scale_ptr+coordinate/16);
-                                        const fp8 scale = fp8::bitcast(scale_code);
-                                        value = (code & 8 ? -magnitude : magnitude) * float(scale);
-                                    }
-                                    components[item] = bf16(value);
-                                }
-                                const int offset = (tile*64+half*8)*TOPK_BLOCK_SIZE;
-                                *reinterpret_cast<uint4*>(sK_nope_base+offset) = *reinterpret_cast<uint4*>(&result);
-                                if constexpr (CLUSTER_SIZE == 2)
-                                    st_async_128b(sK_nope_peer_base+offset, result, peer_bar_k_remote_ready);
+                      // Author: Winston Cai. Expand post-RoPE E2M1 into the
+                      // existing BF16 WGMMA layout; SWA and barriers stay V4.
+                      constexpr int DATA_BYTES =
+                          EXTRA_FP4 == 2
+                              ? PackedFP4CacheFormat::DATA_BYTES
+                              : KVCacheFormat<ModelType::V41_FP4>::QUANT_BYTES;
+                      const bool valid = token_index >= 0;
+                      const uint8_t *page =
+                          reinterpret_cast<const uint8_t *>(k_ptr) +
+                          int64_t(block_index) * k_block_stride;
+                      const uint8_t *data =
+                          page + rel_idx_in_block * DATA_BYTES;
+                      const uint8_t *scale_ptr = page +
+                                                 page_block_size * DATA_BYTES +
+                                                 rel_idx_in_block * 32;
+                      if constexpr (EXTRA_FP4 == 2)
+                        prepare_fp4_row(plan, buf_idx, remnant_row_slot, data,
+                                        scale_ptr, valid, lane_idx);
+#pragma unroll
+                      for (int tile = 0; tile < 8; ++tile) {
+#pragma unroll
+                        for (int half = 0; half < 2; ++half) {
+                          bf16x8 result;
+                          bf16 *components = reinterpret_cast<bf16 *>(&result);
+                          const int coordinate_base =
+                              tile * 64 + (lane_idx / 8) * 16 + half * 8;
+                          uint2 fragment{0, 0};
+                          uint8_t keep_mask = 0xff;
+                          if constexpr (EXTRA_FP4 == 2) {
+                            fragment = load_fp4_fragment(plan, buf_idx,
+                                                         remnant_row_slot,
+                                                         coordinate_base);
+                            const uint64_t keep =
+                                plan.fp4.bitmaps
+                                    [buf_idx]
+                                    [remnant_row_slot *
+                                         PackedFP4CacheFormat::BITMAP_WORDS +
+                                     coordinate_base / 64];
+                            keep_mask =
+                                uint8_t(keep >> (56 - coordinate_base % 64));
+                          }
+#pragma unroll
+                          for (int item = 0; item < 8; ++item) {
+                            const int coordinate = coordinate_base + item;
+                            int code = 0;
+                            if constexpr (EXTRA_FP4 == 2) {
+                              const uint32_t word =
+                                  item < 4 ? fragment.x : fragment.y;
+                              code = (word >> ((item & 3) * 8)) & 15;
+                            } else if (valid) {
+                              const uint8_t byte = __ldg(data + coordinate / 2);
+                              code = (byte >> ((coordinate % 2) * 4)) & 15;
                             }
+                            float value = 0.0f;
+                            if (valid && ((keep_mask >> (7 - item)) & 1)) {
+                              const int mag = code & 7;
+                              const float magnitude =
+                                  mag < 4
+                                      ? mag * 0.5f
+                                      : (mag == 4
+                                             ? 2.0f
+                                             : (mag == 5 ? 3.0f
+                                                         : (mag == 6 ? 4.0f
+                                                                     : 6.0f)));
+                              uint8_t scale_code;
+                              if constexpr (EXTRA_FP4 == 2)
+                                scale_code =
+                                    plan.fp4.scales
+                                        [buf_idx]
+                                        [remnant_row_slot *
+                                             PackedFP4CacheFormat::SCALE_BYTES +
+                                         coordinate / 16];
+                              else
+                                scale_code = __ldg(scale_ptr + coordinate / 16);
+                              const fp8 scale = fp8::bitcast(scale_code);
+                              value = (code & 8 ? -magnitude : magnitude) *
+                                      float(scale);
+                            }
+                            components[item] = bf16(value);
+                          }
+                          const int offset =
+                              (tile * 64 + half * 8) * TOPK_BLOCK_SIZE;
+                          *reinterpret_cast<uint4 *>(sK_nope_base + offset) =
+                              *reinterpret_cast<uint4 *>(&result);
+                          if constexpr (CLUSTER_SIZE == 2)
+                            st_async_128b(sK_nope_peer_base + offset, result,
+                                          peer_bar_k_remote_ready);
                         }
-                        // All cooperating lanes finish reads before the next producer
-                        // round can reuse these scratch rows (not the WGMMA buffer).
-                        if constexpr (EXTRA_FP4 == 2) __syncwarp();
+                      }
+                      // All cooperating lanes finish reads before the next
+                      // producer round can reuse these scratch rows (not the
+                      // WGMMA buffer).
+                      if constexpr (EXTRA_FP4 == 2)
+                        __syncwarp();
                     } else if constexpr (WIDE_PRODUCER && IS_EXTRA_BLOCK) {
-                        static_assert(!WIDE_PRODUCER || (CLUSTER_SIZE == 1 && TOPK_BLOCK_SIZE == 32));
-                        const bool valid = remnant_valid;
-                        const int word = lane_idx / 4;
-                        const auto metadata = prepare_remnant_eight(
-                            params, plan, buf_idx, remnant_row_slot,
-                            valid ? block_index : 0, valid ? rel_idx_in_block : 0,
-                            valid, lane_idx);
-                        // All lanes participate before divergent NoPE ownership.
-                        const int tail_lane = 28 + lane_idx % 4;
-                        const uint64_t tail_keep = __shfl_sync(0xffffffff, static_cast<unsigned long long>(metadata.keep), tail_lane);
-                        const int tail_prefix = __shfl_sync(0xffffffff, metadata.prefix, tail_lane);
-                        const int tail_code = __shfl_sync(0xffffffff, int(metadata.scale), tail_lane);
-                        const uint8_t *packed_values = remnant_eight_values(plan, buf_idx, remnant_row_slot);
-                        if (word < 7) {
-                            const bf16 scale = bf16::bitcast(uint16_t(metadata.scale) << 7);
-                            const auto scale2 = __bfloat162bfloat162(*reinterpret_cast<const __nv_bfloat16 *>(&scale));
-                            #pragma unroll 4
-                            for (int fragment = 0; fragment < 4; ++fragment) {
-                                const fp8x16 raw = expand_remnant_eight16(packed_values, metadata.keep, metadata.prefix, fragment);
-                                bf16x8 a = cvt_fp8x8_bf16x8(raw.lo, scale2);
-                                bf16x8 b = cvt_fp8x8_bf16x8(raw.hi, scale2);
-                                if (!valid) {
-                                    *reinterpret_cast<uint4 *>(&a) = uint4{0, 0, 0, 0};
-                                    *reinterpret_cast<uint4 *>(&b) = uint4{0, 0, 0, 0};
-                                }
-                                bf16 *destination = plan.u.k[buf_idx].data() + my_token_idx * 8
-                                    + (word * 64 + fragment * 16) * TOPK_BLOCK_SIZE;
-                                *reinterpret_cast<uint4 *>(destination) = *reinterpret_cast<uint4 *>(&a);
-                                *reinterpret_cast<uint4 *>(destination + 8 * TOPK_BLOCK_SIZE) = *reinterpret_cast<uint4 *>(&b);
-                            }
+                      static_assert(!WIDE_PRODUCER || (CLUSTER_SIZE == 1 &&
+                                                       TOPK_BLOCK_SIZE == 32));
+                      const bool valid = remnant_valid;
+                      const int word = lane_idx / 4;
+                      const auto metadata = prepare_remnant_eight(
+                          params, plan, buf_idx, remnant_row_slot,
+                          valid ? block_index : 0, valid ? rel_idx_in_block : 0,
+                          valid, lane_idx);
+                      // All lanes participate before divergent NoPE ownership.
+                      const int tail_lane = 28 + lane_idx % 4;
+                      const uint64_t tail_keep = __shfl_sync(
+                          0xffffffff,
+                          static_cast<unsigned long long>(metadata.keep),
+                          tail_lane);
+                      const int tail_prefix =
+                          __shfl_sync(0xffffffff, metadata.prefix, tail_lane);
+                      const int tail_code = __shfl_sync(
+                          0xffffffff, int(metadata.scale), tail_lane);
+                      const uint8_t *packed_values =
+                          remnant_eight_values(plan, buf_idx, remnant_row_slot);
+                      if (word < 7) {
+                        const bf16 scale =
+                            bf16::bitcast(uint16_t(metadata.scale) << 7);
+                        const auto scale2 = __bfloat162bfloat162(
+                            *reinterpret_cast<const __nv_bfloat16 *>(&scale));
+#pragma unroll 4
+                        for (int fragment = 0; fragment < 4; ++fragment) {
+                          const fp8x16 raw = expand_remnant_eight16(
+                              packed_values, metadata.keep, metadata.prefix,
+                              fragment);
+                          bf16x8 a = cvt_fp8x8_bf16x8(raw.lo, scale2);
+                          bf16x8 b = cvt_fp8x8_bf16x8(raw.hi, scale2);
+                          if (!valid) {
+                            *reinterpret_cast<uint4 *>(&a) = uint4{0, 0, 0, 0};
+                            *reinterpret_cast<uint4 *>(&b) = uint4{0, 0, 0, 0};
+                          }
+                          bf16 *destination =
+                              plan.u.k[buf_idx].data() + my_token_idx * 8 +
+                              (word * 64 + fragment * 16) * TOPK_BLOCK_SIZE;
+                          *reinterpret_cast<uint4 *>(destination) =
+                              *reinterpret_cast<uint4 *>(&a);
+                          *reinterpret_cast<uint4 *>(destination +
+                                                     8 * TOPK_BLOCK_SIZE) =
+                              *reinterpret_cast<uint4 *>(&b);
                         }
-                        const int rope_base_dim = word * 8;
-                        const fp8x8 raw_tail = expand_remnant_eight8(packed_values, tail_keep, tail_prefix, word);
-                        const bf16 scale = bf16::bitcast(uint16_t(tail_code) << 7);
-                        bf16x8 cur = cvt_fp8x8_bf16x8(raw_tail, __bfloat162bfloat162(*reinterpret_cast<const __nv_bfloat16 *>(&scale)));
-                            float values[8] = {
-                                (float)cur.a01.x, (float)cur.a01.y,
-                                (float)cur.a23.x, (float)cur.a23.y,
-                                (float)cur.a45.x, (float)cur.a45.y,
-                                (float)cur.a67.x, (float)cur.a67.y,
-                            };
-                            if (valid) {
-                                const int first_pair = raw_token_index * 4 * 32
-                                    + rope_base_dim / 2;
-                                const float *frequency = params.remnant_freqs + first_pair * 2;
-                                float4 first, second;
-                                // Four contiguous cosine/sine values per load.
-                                // Preserve support for contiguous frequency views
-                                // whose storage offset is not 16-byte aligned.
-                                if ((reinterpret_cast<uintptr_t>(frequency) & 15) == 0) {
-                                    first = __ldg(reinterpret_cast<const float4 *>(frequency));
-                                    second = __ldg(reinterpret_cast<const float4 *>(frequency + 4));
-                                } else {
-                                    first = float4{__ldg(frequency), __ldg(frequency + 1),
-                                                   __ldg(frequency + 2), __ldg(frequency + 3)};
-                                    second = float4{__ldg(frequency + 4), __ldg(frequency + 5),
-                                                    __ldg(frequency + 6), __ldg(frequency + 7)};
-                                }
-                                auto rotate_pair = [&](int pair, float c, float s) {
-                                    const float x0 = values[pair * 2];
-                                    const float x1 = values[pair * 2 + 1];
-                                    values[pair * 2] = x0 * c - x1 * s;
-                                    values[pair * 2 + 1] = x0 * s + x1 * c;
-                                };
-                                rotate_pair(0, first.x, first.y);
-                                rotate_pair(1, first.z, first.w);
-                                rotate_pair(2, second.x, second.y);
-                                rotate_pair(3, second.z, second.w);
-                            } else {
-                                for (int i = 0; i < 8; ++i)
-                                    values[i] = 0.0f;
-                            }
-                            cur.a01 = __float22bfloat162_rn({values[0], values[1]});
-                            cur.a23 = __float22bfloat162_rn({values[2], values[3]});
-                            cur.a45 = __float22bfloat162_rn({values[4], values[5]});
-                            cur.a67 = __float22bfloat162_rn({values[6], values[7]});
-                        bf16 *destination = plan.u.k[buf_idx].data() + my_token_idx * 8
-                            + (HEAD_DIM_NOPE + rope_base_dim) * TOPK_BLOCK_SIZE;
-                        *reinterpret_cast<uint4 *>(destination) = *reinterpret_cast<uint4 *>(&cur);
-                    } else if constexpr (REMNANT && MODEL_TYPE == ModelType::V4 && IS_EXTRA_BLOCK) {
-                        const bool valid = token_index != -1 && raw_token_index >= 0;
-                        const int value_base_dim = (lane_idx / 8) * 16;
-                        const int packed_page = valid ? block_index : 0;
-                        const int packed_row = valid ? rel_idx_in_block : 0;
-                        for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE / 64; ++dim_idx) {
-                            const int dim_base = dim_idx * 64 + value_base_dim;
-                            fp8x16 packed = load_remnant_fp8x16(
-                                plan, buf_idx, remnant_row_slot, dim_base, valid
-                            );
-                            bf16 scale = remnant_scale(plan, buf_idx, remnant_row_slot, dim_idx, valid);
-                            bf16x8 first_bf16 = cvt_fp8x8_bf16x8(packed.lo, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
-                            bf16x8 second_bf16 = cvt_fp8x8_bf16x8(packed.hi, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
-                            if (!valid) {
-                                *(uint128_t*)(&first_bf16) = uint128_t();
-                                *(uint128_t*)(&second_bf16) = uint128_t();
-                            }
-                            int smem_offset = (dim_idx * 64) * TOPK_BLOCK_SIZE;
-                            *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&first_bf16;
-                            *(__int128_t*)(sK_nope_base + smem_offset + 8 * TOPK_BLOCK_SIZE) = *(__int128_t*)&second_bf16;
-                            if constexpr (CLUSTER_SIZE == 2) {
-                                st_async_128b(sK_nope_peer_base + smem_offset, first_bf16, peer_bar_k_remote_ready);
-                                st_async_128b(sK_nope_peer_base + smem_offset + 8 * TOPK_BLOCK_SIZE, second_bf16, peer_bar_k_remote_ready);
-                            }
+                      }
+                      const int rope_base_dim = word * 8;
+                      const fp8x8 raw_tail = expand_remnant_eight8(
+                          packed_values, tail_keep, tail_prefix, word);
+                      const bf16 scale =
+                          bf16::bitcast(uint16_t(tail_code) << 7);
+                      bf16x8 cur = cvt_fp8x8_bf16x8(
+                          raw_tail,
+                          __bfloat162bfloat162(
+                              *reinterpret_cast<const __nv_bfloat16 *>(
+                                  &scale)));
+                      float values[8] = {
+                          (float)cur.a01.x, (float)cur.a01.y, (float)cur.a23.x,
+                          (float)cur.a23.y, (float)cur.a45.x, (float)cur.a45.y,
+                          (float)cur.a67.x, (float)cur.a67.y,
+                      };
+                      if (valid) {
+                        const int first_pair =
+                            raw_token_index * 4 * 32 + rope_base_dim / 2;
+                        const float *frequency =
+                            params.remnant_freqs + first_pair * 2;
+                        float4 first, second;
+                        // Four contiguous cosine/sine values per load.
+                        // Preserve support for contiguous frequency views
+                        // whose storage offset is not 16-byte aligned.
+                        if ((reinterpret_cast<uintptr_t>(frequency) & 15) ==
+                            0) {
+                          first = __ldg(
+                              reinterpret_cast<const float4 *>(frequency));
+                          second = __ldg(
+                              reinterpret_cast<const float4 *>(frequency + 4));
+                        } else {
+                          first = float4{__ldg(frequency), __ldg(frequency + 1),
+                                         __ldg(frequency + 2),
+                                         __ldg(frequency + 3)};
+                          second = float4{
+                              __ldg(frequency + 4), __ldg(frequency + 5),
+                              __ldg(frequency + 6), __ldg(frequency + 7)};
                         }
+                        auto rotate_pair = [&](int pair, float c, float s) {
+                          const float x0 = values[pair * 2];
+                          const float x1 = values[pair * 2 + 1];
+                          values[pair * 2] = x0 * c - x1 * s;
+                          values[pair * 2 + 1] = x0 * s + x1 * c;
+                        };
+                        rotate_pair(0, first.x, first.y);
+                        rotate_pair(1, first.z, first.w);
+                        rotate_pair(2, second.x, second.y);
+                        rotate_pair(3, second.z, second.w);
+                      } else {
+                        for (int i = 0; i < 8; ++i)
+                          values[i] = 0.0f;
+                      }
+                      cur.a01 = __float22bfloat162_rn({values[0], values[1]});
+                      cur.a23 = __float22bfloat162_rn({values[2], values[3]});
+                      cur.a45 = __float22bfloat162_rn({values[4], values[5]});
+                      cur.a67 = __float22bfloat162_rn({values[6], values[7]});
+                      bf16 *destination =
+                          plan.u.k[buf_idx].data() + my_token_idx * 8 +
+                          (HEAD_DIM_NOPE + rope_base_dim) * TOPK_BLOCK_SIZE;
+                      *reinterpret_cast<uint4 *>(destination) =
+                          *reinterpret_cast<uint4 *>(&cur);
+                    } else if constexpr (REMNANT &&
+                                         MODEL_TYPE == ModelType::V4 &&
+                                         IS_EXTRA_BLOCK) {
+                      const bool valid =
+                          token_index != -1 && raw_token_index >= 0;
+                      const int value_base_dim = (lane_idx / 8) * 16;
+                      const int packed_page = valid ? block_index : 0;
+                      const int packed_row = valid ? rel_idx_in_block : 0;
+                      for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE / 64;
+                           ++dim_idx) {
+                        const int dim_base = dim_idx * 64 + value_base_dim;
+                        fp8x16 packed = load_remnant_fp8x16(
+                            plan, buf_idx, remnant_row_slot, dim_base, valid);
+                        bf16 scale = remnant_scale(
+                            plan, buf_idx, remnant_row_slot, dim_idx, valid);
+                        bf16x8 first_bf16 = cvt_fp8x8_bf16x8(
+                            packed.lo,
+                            __bfloat162bfloat162(*(__nv_bfloat16 *)(&scale)));
+                        bf16x8 second_bf16 = cvt_fp8x8_bf16x8(
+                            packed.hi,
+                            __bfloat162bfloat162(*(__nv_bfloat16 *)(&scale)));
+                        if (!valid) {
+                          *(uint128_t *)(&first_bf16) = uint128_t();
+                          *(uint128_t *)(&second_bf16) = uint128_t();
+                        }
+                        int smem_offset = (dim_idx * 64) * TOPK_BLOCK_SIZE;
+                        *(__int128_t *)(sK_nope_base + smem_offset) =
+                            *(__int128_t *)&first_bf16;
+                        *(__int128_t *)(sK_nope_base + smem_offset +
+                                        8 * TOPK_BLOCK_SIZE) =
+                            *(__int128_t *)&second_bf16;
+                        if constexpr (CLUSTER_SIZE == 2) {
+                          st_async_128b(sK_nope_peer_base + smem_offset,
+                                        first_bf16, peer_bar_k_remote_ready);
+                          st_async_128b(sK_nope_peer_base + smem_offset +
+                                            8 * TOPK_BLOCK_SIZE,
+                                        second_bf16, peer_bar_k_remote_ready);
+                        }
+                      }
 
-                        // The packed record contains the unrotated tail. Apply
-                        // the model's four-position RoPE stride before storing it.
-                        for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE / 32; ++dim_idx) {
-                            const int rope_base_dim = (lane_idx / 8) * 8;
-                            const int dim_base = HEAD_DIM_NOPE + dim_idx * 32 + rope_base_dim;
-                            fp8x8 first = load_remnant_fp8x8(plan, buf_idx, remnant_row_slot, dim_base, valid);
-                            bf16 scale = remnant_scale(plan, buf_idx, remnant_row_slot, 7, valid);
-                            bf16x8 cur = cvt_fp8x8_bf16x8(first, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
-                            float values[8] = {
-                                (float)cur.a01.x, (float)cur.a01.y,
-                                (float)cur.a23.x, (float)cur.a23.y,
-                                (float)cur.a45.x, (float)cur.a45.y,
-                                (float)cur.a67.x, (float)cur.a67.y,
-                            };
-                            if (valid) {
-                                const int first_pair = raw_token_index * 4 * 32
-                                    + dim_idx * 16 + rope_base_dim / 2;
-                                const float *frequency = params.remnant_freqs + first_pair * 2;
-                                float4 first, second;
-                                // Four contiguous cosine/sine values per load.
-                                // Preserve support for contiguous frequency views
-                                // whose storage offset is not 16-byte aligned.
-                                if ((reinterpret_cast<uintptr_t>(frequency) & 15) == 0) {
-                                    first = __ldg(reinterpret_cast<const float4 *>(frequency));
-                                    second = __ldg(reinterpret_cast<const float4 *>(frequency + 4));
-                                } else {
-                                    first = float4{__ldg(frequency), __ldg(frequency + 1),
-                                                   __ldg(frequency + 2), __ldg(frequency + 3)};
-                                    second = float4{__ldg(frequency + 4), __ldg(frequency + 5),
-                                                    __ldg(frequency + 6), __ldg(frequency + 7)};
-                                }
-                                auto rotate_pair = [&](int pair, float c, float s) {
-                                    const float x0 = values[pair * 2];
-                                    const float x1 = values[pair * 2 + 1];
-                                    values[pair * 2] = x0 * c - x1 * s;
-                                    values[pair * 2 + 1] = x0 * s + x1 * c;
-                                };
-                                rotate_pair(0, first.x, first.y);
-                                rotate_pair(1, first.z, first.w);
-                                rotate_pair(2, second.x, second.y);
-                                rotate_pair(3, second.z, second.w);
-                            } else {
-                                for (int i = 0; i < 8; ++i)
-                                    values[i] = 0.0f;
-                            }
-                            cur.a01 = __float22bfloat162_rn({values[0], values[1]});
-                            cur.a23 = __float22bfloat162_rn({values[2], values[3]});
-                            cur.a45 = __float22bfloat162_rn({values[4], values[5]});
-                            cur.a67 = __float22bfloat162_rn({values[6], values[7]});
-                            const int smem_offset = (HEAD_DIM_NOPE + dim_idx * 32) * TOPK_BLOCK_SIZE;
-                            *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&cur;
-                            if constexpr (CLUSTER_SIZE == 2)
-                                st_async_128b(sK_rope_peer_base + smem_offset, cur, peer_bar_k_remote_ready);
+                      // The packed record contains the unrotated tail. Apply
+                      // the model's four-position RoPE stride before storing
+                      // it.
+                      for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE / 32;
+                           ++dim_idx) {
+                        const int rope_base_dim = (lane_idx / 8) * 8;
+                        const int dim_base =
+                            HEAD_DIM_NOPE + dim_idx * 32 + rope_base_dim;
+                        fp8x8 first = load_remnant_fp8x8(
+                            plan, buf_idx, remnant_row_slot, dim_base, valid);
+                        bf16 scale = remnant_scale(plan, buf_idx,
+                                                   remnant_row_slot, 7, valid);
+                        bf16x8 cur = cvt_fp8x8_bf16x8(
+                            first,
+                            __bfloat162bfloat162(*(__nv_bfloat16 *)(&scale)));
+                        float values[8] = {
+                            (float)cur.a01.x, (float)cur.a01.y,
+                            (float)cur.a23.x, (float)cur.a23.y,
+                            (float)cur.a45.x, (float)cur.a45.y,
+                            (float)cur.a67.x, (float)cur.a67.y,
+                        };
+                        if (valid) {
+                          const int first_pair = raw_token_index * 4 * 32 +
+                                                 dim_idx * 16 +
+                                                 rope_base_dim / 2;
+                          const float *frequency =
+                              params.remnant_freqs + first_pair * 2;
+                          float4 first, second;
+                          // Four contiguous cosine/sine values per load.
+                          // Preserve support for contiguous frequency views
+                          // whose storage offset is not 16-byte aligned.
+                          if ((reinterpret_cast<uintptr_t>(frequency) & 15) ==
+                              0) {
+                            first = __ldg(
+                                reinterpret_cast<const float4 *>(frequency));
+                            second = __ldg(reinterpret_cast<const float4 *>(
+                                frequency + 4));
+                          } else {
+                            first = float4{
+                                __ldg(frequency), __ldg(frequency + 1),
+                                __ldg(frequency + 2), __ldg(frequency + 3)};
+                            second = float4{
+                                __ldg(frequency + 4), __ldg(frequency + 5),
+                                __ldg(frequency + 6), __ldg(frequency + 7)};
+                          }
+                          auto rotate_pair = [&](int pair, float c, float s) {
+                            const float x0 = values[pair * 2];
+                            const float x1 = values[pair * 2 + 1];
+                            values[pair * 2] = x0 * c - x1 * s;
+                            values[pair * 2 + 1] = x0 * s + x1 * c;
+                          };
+                          rotate_pair(0, first.x, first.y);
+                          rotate_pair(1, first.z, first.w);
+                          rotate_pair(2, second.x, second.y);
+                          rotate_pair(3, second.z, second.w);
+                        } else {
+                          for (int i = 0; i < 8; ++i)
+                            values[i] = 0.0f;
                         }
+                        cur.a01 = __float22bfloat162_rn({values[0], values[1]});
+                        cur.a23 = __float22bfloat162_rn({values[2], values[3]});
+                        cur.a45 = __float22bfloat162_rn({values[4], values[5]});
+                        cur.a67 = __float22bfloat162_rn({values[6], values[7]});
+                        const int smem_offset =
+                            (HEAD_DIM_NOPE + dim_idx * 32) * TOPK_BLOCK_SIZE;
+                        *(__int128_t *)(sK_rope_base + smem_offset) =
+                            *(__int128_t *)&cur;
+                        if constexpr (CLUSTER_SIZE == 2)
+                          st_async_128b(sK_rope_peer_base + smem_offset, cur,
+                                        peer_bar_k_remote_ready);
+                      }
                     } else if constexpr (WIDE_PRODUCER) {
-                        static_assert(!WIDE_PRODUCER || (MODEL_TYPE == ModelType::V4 && CLUSTER_SIZE == 1));
-                        const int group = lane_idx / 4;
-                        const int coordinate = group * 8;
-                        #pragma unroll
-                        for (int word = 0; word < HEAD_DIM_NOPE / 64; ++word) {
-                            fp8x8 raw;
-                            *reinterpret_cast<uint64_t *>(&raw) = __ldg(reinterpret_cast<const uint64_t *>(gK_base + word * 64 + coordinate));
-                            if (token_index == -1) *reinterpret_cast<uint64_t *>(&raw) = 0;
-                            bf16 scale = token_index == -1 ? bf16(0.0f) : scales[word];
-                            bf16x8 value = cvt_fp8x8_bf16x8(raw, __bfloat162bfloat162(*reinterpret_cast<const __nv_bfloat16 *>(&scale)));
-                            bf16 *destination = plan.u.k[buf_idx].data() + my_token_idx * 8
-                                + (word * 64 + coordinate) * TOPK_BLOCK_SIZE;
-                            *reinterpret_cast<uint4 *>(destination) = *reinterpret_cast<uint4 *>(&value);
-                        }
-                        bf16 *source = reinterpret_cast<bf16 *>(gK_base + HEAD_DIM_NOPE) + coordinate;
-                        bf16x8 tail = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(source);
-                        if (token_index == -1) *reinterpret_cast<uint4 *>(&tail) = uint4{0, 0, 0, 0};
-                        bf16 *destination = plan.u.k[buf_idx].data() + my_token_idx * 8
-                            + (HEAD_DIM_NOPE + coordinate) * TOPK_BLOCK_SIZE;
-                        *reinterpret_cast<uint4 *>(destination) = *reinterpret_cast<uint4 *>(&tail);
+                      static_assert(
+                          !WIDE_PRODUCER ||
+                          (MODEL_TYPE == ModelType::V4 && CLUSTER_SIZE == 1));
+                      const int group = lane_idx / 4;
+                      const int coordinate = group * 8;
+#pragma unroll
+                      for (int word = 0; word < HEAD_DIM_NOPE / 64; ++word) {
+                        fp8x8 raw;
+                        *reinterpret_cast<uint64_t *>(&raw) =
+                            __ldg(reinterpret_cast<const uint64_t *>(
+                                gK_base + word * 64 + coordinate));
+                        if (token_index == -1)
+                          *reinterpret_cast<uint64_t *>(&raw) = 0;
+                        bf16 scale =
+                            token_index == -1 ? bf16(0.0f) : scales[word];
+                        bf16x8 value = cvt_fp8x8_bf16x8(
+                            raw, __bfloat162bfloat162(
+                                     *reinterpret_cast<const __nv_bfloat16 *>(
+                                         &scale)));
+                        bf16 *destination =
+                            plan.u.k[buf_idx].data() + my_token_idx * 8 +
+                            (word * 64 + coordinate) * TOPK_BLOCK_SIZE;
+                        *reinterpret_cast<uint4 *>(destination) =
+                            *reinterpret_cast<uint4 *>(&value);
+                      }
+                      bf16 *source =
+                          reinterpret_cast<bf16 *>(gK_base + HEAD_DIM_NOPE) +
+                          coordinate;
+                      bf16x8 tail =
+                          load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST,
+                                              L2PrefetchHint::B128>(source);
+                      if (token_index == -1)
+                        *reinterpret_cast<uint4 *>(&tail) = uint4{0, 0, 0, 0};
+                      bf16 *destination =
+                          plan.u.k[buf_idx].data() + my_token_idx * 8 +
+                          (HEAD_DIM_NOPE + coordinate) * TOPK_BLOCK_SIZE;
+                      *reinterpret_cast<uint4 *>(destination) =
+                          *reinterpret_cast<uint4 *>(&tail);
                     } else {
-                    fp8* gK_nope = gK_base + (lane_idx/8)*16;
-                    if (token_index == -1) {
+                      fp8 *gK_nope = gK_base + (lane_idx / 8) * 16;
+                      if (token_index == -1) {
                         CUTE_UNROLL
                         for (int i = 0; i < NUM_SCALES; ++i)
                             scales[i] = (bf16)0.0f;
@@ -1378,7 +1529,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfu
                         if constexpr (IS_V32_LIKE) {
                             return index != -1;
                         } else {
-                            return index != -1 && (EXTRA_FP4 == 0 || !IS_EXTRA_BLOCK || (index >= 0 && index < params.extra_num_blocks * page_block_size)) && rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length;
+                          return index != -1 &&
+                                 (EXTRA_FP4 == 0 || !IS_EXTRA_BLOCK ||
+                                  (index >= 0 &&
+                                   index < params.extra_num_blocks *
+                                               page_block_size)) &&
+                                 rel_block_idx * TOPK_BLOCK_SIZE +
+                                         lane_idx * 2 + offset_within_thread <
+                                     topk_length;
                         }
                     };
                     int2 indices = __ldg((int2*)(indices_base + lane_idx*2));
@@ -1421,7 +1579,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::devfu
         CUTE_INVALID_CONTROL_PATH("This kernel only supports sm90");
     }
 #endif
-
 }
 
 template<typename Kernel, typename TMAParams>
@@ -1430,106 +1587,114 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     Kernel::devfunc(params, tma_params);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
-void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(const SparseAttnDecodeParams &params) {
-    KU_ASSERT(params.h_kv == 1);
-    KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
-    KU_ASSERT(params.d_qk == HEAD_DIM_K);
-    KU_ASSERT(params.d_v == HEAD_DIM_V);
-    KU_ASSERT(params.h_q % BLOCK_M == 0);
-    if constexpr (MODEL_TYPE == ModelType::V4) {
-        constexpr int BYTES_PER_TOKEN = HEAD_DIM_NOPE + 2*HEAD_DIM_ROPE + 8;
-        KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in DeepSeek-V4");  // Each block must be contiguous
-        if (params.extra_kv != nullptr) {
-            KU_ASSERT(params.stride_extra_kv_row == (EXTRA_FP4 == 2 ? 224 : (EXTRA_FP4 == 1 ? 288 : BYTES_PER_TOKEN)), "Each page block in extra KV cache must be contiguous for head64 sparse fp8 decoding attention in DeepSeek-V4");  // Each block must be contiguous
-        }
-    } else {
-        KU_ASSERT(params.extra_kv == nullptr, "V3.2 does not support extra KV cache");
-        KU_ASSERT(params.topk_length == nullptr, "V3.2 does not support dynamic topk length");
-        // Bytes per token: 656 for V3.2 (512 fp8 + 4 float32 + 64 bfloat16), 528 for V3.2-no-RoPE (512 fp8 + 4 float32)
-        KU_ASSERT(params.stride_kv_row == HEAD_DIM_NOPE + NUM_SCALES*(int)sizeof(float) + HEAD_DIM_ROPE*(int)sizeof(bf16));
+template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
+void KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(
+    const SparseAttnDecodeParams &params) {
+  KU_ASSERT(params.h_kv == 1);
+  KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
+  KU_ASSERT(params.d_qk == HEAD_DIM_K);
+  KU_ASSERT(params.d_v == HEAD_DIM_V);
+  KU_ASSERT(params.h_q % BLOCK_M == 0);
+  if constexpr (MODEL_TYPE == ModelType::V4) {
+    constexpr int BYTES_PER_TOKEN = HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE + 8;
+    KU_ASSERT(
+        params.stride_kv_row == BYTES_PER_TOKEN,
+        "Each page block in KV cache must be contiguous for head64 sparse fp8 "
+        "decoding attention in DeepSeek-V4"); // Each block must be contiguous
+    if (params.extra_kv != nullptr) {
+      KU_ASSERT(
+          params.stride_extra_kv_row ==
+              (EXTRA_FP4 == 2
+                   ? PackedFP4CacheFormat::BYTES_PER_TOKEN
+                   : (EXTRA_FP4 == 1
+                          ? KVCacheFormat<ModelType::V41_FP4>::BYTES_PER_TOKEN
+                          : BYTES_PER_TOKEN)),
+          "Each page block in extra KV cache must be contiguous for head64 "
+          "sparse fp8 decoding attention in DeepSeek-V4"); // Each block must be
+                                                           // contiguous
     }
+  } else {
+    KU_ASSERT(params.extra_kv == nullptr,
+              "V3.2 does not support extra KV cache");
+    KU_ASSERT(params.topk_length == nullptr,
+              "V3.2 does not support dynamic topk length");
+    // Bytes per token: 656 for V3.2 (512 fp8 + 4 float32 + 64 bfloat16), 528
+    // for V3.2-no-RoPE (512 fp8 + 4 float32)
+    KU_ASSERT(params.stride_kv_row == HEAD_DIM_NOPE +
+                                          NUM_SCALES * (int)sizeof(float) +
+                                          HEAD_DIM_ROPE * (int)sizeof(bf16));
+  }
 
-    auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q, params.b);
-    auto tma_Q = cute::make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(
-            make_gmem_ptr((bf16*)params.q),
-            make_layout(
-                shape_Q,
-                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q, params.stride_q_b)
-            )
-        ),
-        SmemLayoutQ{}
-    );
-    
-    CUtensorMap tensor_map_o;
-    {
-        // Here we manually construct TMA descriptor to store O, in order to leverage 5D TMA
-        uint64_t size[5] = {OBUF_SW, (unsigned long)params.h_q, HEAD_DIM_V/OBUF_SW, (unsigned long)params.s_q, (unsigned long)params.b};
-        uint64_t stride[4] = {params.stride_o_h_q*sizeof(bf16), OBUF_SW*sizeof(bf16), params.stride_o_s_q*sizeof(bf16), params.stride_o_b*sizeof(bf16)};
-        uint32_t box_size[5] = {OBUF_SW, BLOCK_M, HEAD_DIM_V/OBUF_SW, 1, 1};
-        uint32_t elem_stride[5] = {1, 1, 1, 1, 1};
-        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-            &tensor_map_o,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            5,
-            params.out,
-            size,
-            stride,
-            box_size,
-            elem_stride,
-            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-            OBUF_SW == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B :
-                OBUF_SW == 32 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B :
-                OBUF_SW == 16 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B :
-                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-        );
-        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
-    }
+  auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q, params.b);
+  auto tma_Q = cute::make_tma_copy(
+      SM90_TMA_LOAD{},
+      make_tensor(make_gmem_ptr((bf16 *)params.q),
+                  make_layout(shape_Q, make_stride(params.stride_q_h_q, _1{},
+                                                   params.stride_q_s_q,
+                                                   params.stride_q_b))),
+      SmemLayoutQ{});
 
-    TmaParams<
-        decltype(shape_Q), decltype(tma_Q)
-    > tma_params = {
-        shape_Q, tma_Q,
-        tensor_map_o
-    };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>, decltype(tma_params)>;
+  CUtensorMap tensor_map_o;
+  {
+    // Here we manually construct TMA descriptor to store O, in order to
+    // leverage 5D TMA
+    uint64_t size[5] = {OBUF_SW, (unsigned long)params.h_q,
+                        HEAD_DIM_V / OBUF_SW, (unsigned long)params.s_q,
+                        (unsigned long)params.b};
+    uint64_t stride[4] = {
+        params.stride_o_h_q * sizeof(bf16), OBUF_SW * sizeof(bf16),
+        params.stride_o_s_q * sizeof(bf16), params.stride_o_b * sizeof(bf16)};
+    uint32_t box_size[5] = {OBUF_SW, BLOCK_M, HEAD_DIM_V / OBUF_SW, 1, 1};
+    uint32_t elem_stride[5] = {1, 1, 1, 1, 1};
+    CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+        &tensor_map_o, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5,
+        params.out, size, stride, box_size, elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        OBUF_SW == 64   ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+        : OBUF_SW == 32 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B
+        : OBUF_SW == 16 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B
+                        : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    KU_ASSERT(res == CUresult::CUDA_SUCCESS);
+  }
 
-    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
-    KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  TmaParams<decltype(shape_Q), decltype(tma_Q)> tma_params = {shape_Q, tma_Q,
+                                                              tensor_map_o};
+  auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<
+      KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>,
+      decltype(tma_params)>;
 
-    // NOTE Don't use PDL because of potential compiler bugs!
-    // cudaLaunchAttribute mla_kernel_attributes[1];
-    // mla_kernel_attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    // mla_kernel_attributes[0].val.programmaticStreamSerializationAllowed = 1;
-    // cudaLaunchConfig_t mla_kernel_config = {
-    //     dim3(num_m_block, params.h_k, params.num_sm_parts),
-    //     dim3(NUM_THREADS, 1, 1),
-    //     smem_size,
-    //     stream,
-    //     mla_kernel_attributes,
-    //     1
-    // };
-    // cudaLaunchKernelEx(&mla_kernel_config, mla_kernel, params, tma_params);
-    cutlass::ClusterLaunchParams launch_params = {
-        dim3(NUM_M_BLOCKS, params.s_q, params.num_sm_parts),
-        dim3(NUM_THREADS, 1, 1),
-        dim3(CLUSTER_SIZE, 1, 1),
-        smem_size,
-        params.stream
-    };
-    cutlass::launch_kernel_on_cluster(
-        launch_params, (void*)mla_kernel, params, tma_params
-    );
-    KU_CHECK_KERNEL_LAUNCH();
+  constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+  KU_CUDA_CHECK(cudaFuncSetAttribute(
+      mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  // NOTE Don't use PDL because of potential compiler bugs!
+  // cudaLaunchAttribute mla_kernel_attributes[1];
+  // mla_kernel_attributes[0].id =
+  // cudaLaunchAttributeProgrammaticStreamSerialization;
+  // mla_kernel_attributes[0].val.programmaticStreamSerializationAllowed = 1;
+  // cudaLaunchConfig_t mla_kernel_config = {
+  //     dim3(num_m_block, params.h_k, params.num_sm_parts),
+  //     dim3(NUM_THREADS, 1, 1),
+  //     smem_size,
+  //     stream,
+  //     mla_kernel_attributes,
+  //     1
+  // };
+  // cudaLaunchKernelEx(&mla_kernel_config, mla_kernel, params, tma_params);
+  cutlass::ClusterLaunchParams launch_params = {
+      dim3(NUM_M_BLOCKS, params.s_q, params.num_sm_parts),
+      dim3(NUM_THREADS, 1, 1), dim3(CLUSTER_SIZE, 1, 1), smem_size,
+      params.stream};
+  cutlass::launch_kernel_on_cluster(launch_params, (void *)mla_kernel, params,
+                                    tma_params);
+  KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
-void run_flash_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams &params) {
-    KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(params);
+template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT, int EXTRA_FP4>
+void run_flash_splitkv_mla_fp8_sparse_kernel(
+    const SparseAttnDecodeParams &params) {
+  KernelTemplate<MODEL_TYPE, NUM_HEADS, REMNANT, EXTRA_FP4>::run(params);
 }
-
 }

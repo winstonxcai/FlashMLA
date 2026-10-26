@@ -1,17 +1,16 @@
 """Build the selected FlashMLA fork. Packed additions: Author: Winston Cai."""
 
 import os
-from pathlib import Path
-from datetime import datetime
 import subprocess
+from datetime import datetime
+from pathlib import Path
 
-from setuptools import setup, find_packages
-
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import (
+    CUDA_HOME,
+    IS_WINDOWS,
     BuildExtension,
     CUDAExtension,
-    IS_WINDOWS,
-    CUDA_HOME
 )
 
 
@@ -73,15 +72,12 @@ flashmla_sources = [
     "csrc/api/dense_bwd.cpp",
     "csrc/api/dense_decode.cpp",
     "csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
-
     # Misc kernels for decoding
     "csrc/kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
     "csrc/kernels/smxx/decode/combine/combine.cu",
-
     # sm90 dense decode
     "csrc/kernels/sm90/decode/dense/instantiations/fp16.cu",
     "csrc/kernels/sm90/decode/dense/instantiations/bf16.cu",
-
     # sm90 sparse decode
     "csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_native_h64.cu",
     "csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_native_h128.cu",
@@ -95,7 +91,6 @@ flashmla_sources = [
     "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu",
     "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu",
     "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h128.cu",
-
     # sm90 sparse prefill
     "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu",
     "csrc/kernels/sm90/prefill/sparse/instantiations/fp4_prefill_k512.cu",
@@ -103,18 +98,15 @@ flashmla_sources = [
     "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
     "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu",
     "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
-
     # sm100 dense prefill & backward
     "csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
     "csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-
     # sm100 sparse prefill
     "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
     "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k576.cu",
     "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
     "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
     "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu",
-
     # sm100 fused norm + rope + attn + rope + cast
     "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_norm.cu",
     "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_nonorm.cu",
@@ -134,7 +126,6 @@ flashmla_sources = [
     "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_nonorm.cu",
     "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
     "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
-
     # sm100 sparse decode
     "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64.cu",
     "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu",

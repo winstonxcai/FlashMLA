@@ -45,8 +45,8 @@ sparse_attn_decode_interface(
 );
 
 std::vector<at::Tensor> fp4_sparse_attn_prefill_interface(
-    const at::Tensor&, const at::Tensor&, const at::Tensor&, float, int,
-    const std::optional<at::Tensor>&, const std::optional<at::Tensor>&);
+    const at::Tensor &, const at::Tensor &, const at::Tensor &, float, int,
+    const std::optional<at::Tensor> &, const std::optional<at::Tensor> &);
 
 std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &q,
@@ -222,23 +222,16 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 
 // Author: Winston Cai. Match SGLang log2 outputs through the FP4-only entry.
 std::vector<at::Tensor> fp4_sparse_prefill_fwd(
-    const at::Tensor& q,
-    const at::Tensor& kv,
-    const at::Tensor& indices,
-    double sm_scale,
-    int64_t d_v,
-    const std::optional<at::Tensor>& attn_sink = std::nullopt,
-    const std::optional<at::Tensor>& topk_length = std::nullopt) {
-    auto result = fp4_sparse_attn_prefill_interface(
-        q,
-        kv,
-        indices,
-        static_cast<float>(sm_scale),
-        static_cast<int>(d_v),
-        attn_sink,
-        topk_length);
-    // Keep SGL compatibility: this API historically returns max_logits/lse in log2 space.
-    result[1].mul_(LOG_2_E);
-    result[2].mul_(LOG_2_E);
-    return result;
+    const at::Tensor &q, const at::Tensor &kv, const at::Tensor &indices,
+    double sm_scale, int64_t d_v,
+    const std::optional<at::Tensor> &attn_sink = std::nullopt,
+    const std::optional<at::Tensor> &topk_length = std::nullopt) {
+  auto result = fp4_sparse_attn_prefill_interface(
+      q, kv, indices, static_cast<float>(sm_scale), static_cast<int>(d_v),
+      attn_sink, topk_length);
+  // Keep SGL compatibility: this API historically returns max_logits/lse in
+  // log2 space.
+  result[1].mul_(LOG_2_E);
+  result[2].mul_(LOG_2_E);
+  return result;
 }

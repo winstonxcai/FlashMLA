@@ -16,12 +16,12 @@ using namespace cute;
 // instructions; warp participation, resource IDs and phase counts stay intact.
 // The original static policy is retained for every stock instantiation.
 struct FP4PrefillNamedBarrier {
-    CUTLASS_DEVICE static void arrive_and_wait(uint32_t count, uint32_t id) {
-        cutlass::arch::NamedBarrier(count, id).arrive_and_wait_unaligned();
-    }
-    CUTLASS_DEVICE static void arrive(uint32_t count, uint32_t id) {
-        cutlass::arch::NamedBarrier(count, id).arrive_unaligned();
-    }
+  CUTLASS_DEVICE static void arrive_and_wait(uint32_t count, uint32_t id) {
+    cutlass::arch::NamedBarrier(count, id).arrive_and_wait_unaligned();
+  }
+  CUTLASS_DEVICE static void arrive(uint32_t count, uint32_t id) {
+    cutlass::arch::NamedBarrier(count, id).arrive_unaligned();
+  }
 };
 
 CUTE_DEVICE void st_global_cs_128(float f0, float f1, float f2, float f3, void *dst_ptr) {
@@ -54,43 +54,50 @@ void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes
                      : "memory");
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
-template<typename TMAParams>
-__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
+template <int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
+template <typename TMAParams>
+__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::devfunc(
+    const SparseAttnFwdParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
-    static_assert(NamedBarriers::epilogue_sync + cutlass::arch::NamedBarrier::ReservedNamedBarrierCount < 16);
-    using NamedBarrier = std::conditional_t<FP4_PREFILL, FP4PrefillNamedBarrier, cutlass::arch::NamedBarrier>;
-    const int q_h_idx = blockIdx.x % (params.h_q/B_H);
-    const int s_q_idx = blockIdx.x / (params.h_q/B_H);
-    const int warpgroup_idx = cutlass::canonical_warp_group_idx();
-    const int warp_idx = cutlass::canonical_warp_idx_sync();
-    const int idx_in_warpgroup = threadIdx.x % 128;
+  static_assert(NamedBarriers::epilogue_sync +
+                    cutlass::arch::NamedBarrier::ReservedNamedBarrierCount <
+                16);
+  using NamedBarrier = std::conditional_t<FP4_PREFILL, FP4PrefillNamedBarrier,
+                                          cutlass::arch::NamedBarrier>;
+  const int q_h_idx = blockIdx.x % (params.h_q / B_H);
+  const int s_q_idx = blockIdx.x / (params.h_q / B_H);
+  const int warpgroup_idx = cutlass::canonical_warp_group_idx();
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int idx_in_warpgroup = threadIdx.x % 128;
 
-    // Define shared tensors
-    extern __shared__ char wksp_buf[];
-    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
-    Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ{});
-    Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO{});
-    Tensor sS0 = make_tensor(make_smem_ptr(D_QK == 576 ? plan.k[0].data()+64*512 : plan.s[1].data()), SmemLayoutS{});    // Overlap with sK0's RoPE part for V3.2
-    Tensor sS1 = make_tensor(make_smem_ptr(plan.s[0].data()), SmemLayoutS{});
+  // Define shared tensors
+  extern __shared__ char wksp_buf[];
+  SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan *>(wksp_buf);
+  Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ{});
+  Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO{});
+  Tensor sS0 =
+      make_tensor(make_smem_ptr(D_QK == 576 ? plan.k[0].data() + 64 * 512
+                                            : plan.s[1].data()),
+                  SmemLayoutS{}); // Overlap with sK0's RoPE part for V3.2
+  Tensor sS1 = make_tensor(make_smem_ptr(plan.s[0].data()), SmemLayoutS{});
 
-    if (warp_idx == 0 && elect_one_sync()) {
-        // Prefetch TMA descriptors
-        cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(&tma_params.tensor_map_O);
+  if (warp_idx == 0 && elect_one_sync()) {
+    // Prefetch TMA descriptors
+    cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
+    cute::prefetch_tma_descriptor(&tma_params.tensor_map_O);
 
-        // Initialize barriers
-        plan.bar_q.init(1);
-        CUTE_UNROLL
-        for (int i = 0; i < 2; ++i) {
-            plan.bar_k0_free[i].init(128);
-            plan.bar_k0_ready[i].init(128);
-            plan.bar_k1_free[i].init(128);
-            plan.bar_k1_ready[i].init(128);
-        }
-        plan.bar_is_kv_valid_ready.init(16);
-        fence_barrier_init();
+    // Initialize barriers
+    plan.bar_q.init(1);
+    CUTE_UNROLL
+    for (int i = 0; i < 2; ++i) {
+      plan.bar_k0_free[i].init(128);
+      plan.bar_k0_ready[i].init(128);
+      plan.bar_k1_free[i].init(128);
+      plan.bar_k1_ready[i].init(128);
     }
+    plan.bar_is_kv_valid_ready.init(16);
+    fence_barrier_init();
+  }
 
     __syncthreads();
     
@@ -588,76 +595,61 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     Kernel::devfunc(params, tma_params);
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
-void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::run(const SparseAttnFwdParams &params) {
-    KU_ASSERT(params.h_kv == 1);
-    KU_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
-    KU_ASSERT(params.topk > 0);
-    KU_ASSERT(params.h_q % B_H == 0);
+template <int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
+void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::run(
+    const SparseAttnFwdParams &params) {
+  KU_ASSERT(params.h_kv == 1);
+  KU_ASSERT(params.topk % (2 * B_TOPK) == 0); // To save some boundry checkings
+  KU_ASSERT(params.topk > 0);
+  KU_ASSERT(params.h_q % B_H == 0);
 
-    auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
-    auto tma_Q = cute::make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(
-            make_gmem_ptr((bf16*)params.q),
-            make_layout(
-                shape_Q,
-                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
-            )
-        ),
-        SmemLayoutQ{}
-    );
+  auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
+  auto tma_Q = cute::make_tma_copy(
+      SM90_TMA_LOAD{},
+      make_tensor(make_gmem_ptr((bf16 *)params.q),
+                  make_layout(shape_Q, make_stride(params.stride_q_h_q, _1{},
+                                                   params.stride_q_s_q))),
+      SmemLayoutQ{});
 
-    CUtensorMap tensor_map_O;
-    {
-        uint64_t size[3] = {D_V, (unsigned long)params.h_q, (unsigned long)params.s_q};
-        uint64_t stride[2] = {D_V*sizeof(bf16), D_V*params.h_q*sizeof(bf16)};
-        uint32_t box_size[3] = {64, B_H, 1};
-        uint32_t elem_stride[3] = {1, 1, 1};
-        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-            &tensor_map_O,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            3,
-            params.out,
-            size,
-            stride,
-            box_size,
-            elem_stride,
-            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-        );
-        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
-    }
+  CUtensorMap tensor_map_O;
+  {
+    uint64_t size[3] = {D_V, (unsigned long)params.h_q,
+                        (unsigned long)params.s_q};
+    uint64_t stride[2] = {D_V * sizeof(bf16), D_V * params.h_q * sizeof(bf16)};
+    uint32_t box_size[3] = {64, B_H, 1};
+    uint32_t elem_stride[3] = {1, 1, 1};
+    CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+        &tensor_map_O, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
+        params.out, size, stride, box_size, elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    KU_ASSERT(res == CUresult::CUDA_SUCCESS);
+  }
 
-    TmaParams<
-        decltype(shape_Q), decltype(tma_Q)
-    > tma_params = {
-        shape_Q, tma_Q,
-        tensor_map_O
-    };
-    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>, decltype(tma_params)>;
+  TmaParams<decltype(shape_Q), decltype(tma_Q)> tma_params = {shape_Q, tma_Q,
+                                                              tensor_map_O};
+  auto kernel = &sparse_attn_fwd_kernel<
+      KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>,
+      decltype(tma_params)>;
 
-    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
-    KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+  KU_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    cutlass::ClusterLaunchParams launch_params = {
-        dim3((params.h_q/B_H)*params.s_q, 1, 1),    // NOTE: We put s_q on the first dim since it can be larger than 65536 (the maximum size of griddim.y and griddim.z)
-        dim3(NUM_THREADS, 1, 1),
-        dim3(1, 1, 1),
-        smem_size,
-        params.stream
-    }; 
-    cutlass::launch_kernel_on_cluster(
-        launch_params, (void*)kernel, params, tma_params
-    );
-    KU_CHECK_KERNEL_LAUNCH();
+  cutlass::ClusterLaunchParams launch_params = {
+      dim3((params.h_q / B_H) * params.s_q, 1,
+           1), // NOTE: We put s_q on the first dim since it can be larger than
+               // 65536 (the maximum size of griddim.y and griddim.z)
+      dim3(NUM_THREADS, 1, 1), dim3(1, 1, 1), smem_size, params.stream};
+  cutlass::launch_kernel_on_cluster(launch_params, (void *)kernel, params,
+                                    tma_params);
+  KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
-void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-    KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::run(params);
+template <int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL>
+void run_fwd_phase1_kernel(const SparseAttnFwdParams &params) {
+  KernelTemplate<D_QK, HAVE_TOPK_LENGTH, FP4_PREFILL>::run(params);
 }
-
 }

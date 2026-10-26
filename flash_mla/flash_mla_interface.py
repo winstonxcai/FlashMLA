@@ -1,11 +1,12 @@
 """FlashMLA interface. Packed extension: Author: Winston Cai."""
 
-from typing import Optional, Tuple
 import dataclasses
+from typing import Optional, Tuple
 
 import torch
 
 import flash_mla.cuda as flash_mla_cuda
+
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:

@@ -1,4 +1,5 @@
-// Author: Winston Cai. Separate FP4 prefill specialization; stock dispatch retained.
+// Author: Winston Cai. Separate FP4 prefill specialization; stock dispatch
+// retained.
 #include "common.h"
 
 #include "kernels/params.h"
@@ -97,20 +98,16 @@ protected:
 };
 #endif
 
-template<bool FP4_PREFILL>
-static std::vector<at::Tensor> sparse_attn_prefill_impl(
-    const at::Tensor &q,
-    const at::Tensor &kv,
-    const at::Tensor &indices,
-    float sm_scale,
-    int d_v,
-    const std::optional<at::Tensor> &attn_sink,
-    const std::optional<at::Tensor> &topk_length
-) {
-    using bf16 = cutlass::bfloat16_t;
-    
-    Arch arch = Arch();
-    bool is_sm90a = arch.is_sm90a();
+template <bool FP4_PREFILL>
+static std::vector<at::Tensor>
+sparse_attn_prefill_impl(const at::Tensor &q, const at::Tensor &kv,
+                         const at::Tensor &indices, float sm_scale, int d_v,
+                         const std::optional<at::Tensor> &attn_sink,
+                         const std::optional<at::Tensor> &topk_length) {
+  using bf16 = cutlass::bfloat16_t;
+
+  Arch arch = Arch();
+  bool is_sm90a = arch.is_sm90a();
 #ifdef FLASHMLA_ENABLE_SM100
     bool is_sm100f = arch.is_sm100f();
     TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
@@ -136,7 +133,7 @@ static std::vector<at::Tensor> sparse_attn_prefill_impl(
     TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
     TORCH_CHECK(!FP4_PREFILL || d_qk == 512, "FP4 prefill requires D512");
-    
+
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
     KU_CHECK_DEVICE(indices);
@@ -217,14 +214,15 @@ static std::vector<at::Tensor> sparse_attn_prefill_impl(
     }
 
     if (is_sm90a) {
-        if constexpr (FP4_PREFILL) {
-            DISPATCH_BOOLEAN_FLAG(have_topk_length, HAVE_TOPK_LENGTH, [&]() {
-                sm90::prefill::sparse_fwd::run_fwd_phase1_kernel<512, HAVE_TOPK_LENGTH, true>(params);
-            });
-        } else {
-            Fwd_Sm90_Impl fwd_impl;
-            fwd_impl.run(params, required_features);
-        }
+      if constexpr (FP4_PREFILL) {
+        DISPATCH_BOOLEAN_FLAG(have_topk_length, HAVE_TOPK_LENGTH, [&]() {
+          sm90::prefill::sparse_fwd::run_fwd_phase1_kernel<
+              512, HAVE_TOPK_LENGTH, true>(params);
+        });
+      } else {
+        Fwd_Sm90_Impl fwd_impl;
+        fwd_impl.run(params, required_features);
+      }
 #ifdef FLASHMLA_ENABLE_SM100
     } else if (is_sm100f) {
         if (h_q == 64) {
@@ -260,28 +258,28 @@ static std::vector<at::Tensor> sparse_attn_prefill_impl(
     return {out, max_logits, lse};
 }
 
-
 // Author: Winston Cai. Keep the stock entry and opt-in FP4 prefill distinct.
 std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &q, const at::Tensor &kv, const at::Tensor &indices,
     float sm_scale, int d_v, const std::optional<at::Tensor> &attn_sink,
     const std::optional<at::Tensor> &topk_length) {
-    return sparse_attn_prefill_impl<false>(q, kv, indices, sm_scale, d_v, attn_sink, topk_length);
+  return sparse_attn_prefill_impl<false>(q, kv, indices, sm_scale, d_v,
+                                         attn_sink, topk_length);
 }
 
 std::vector<at::Tensor> fp4_sparse_attn_prefill_interface(
     const at::Tensor &q, const at::Tensor &kv, const at::Tensor &indices,
     float sm_scale, int d_v, const std::optional<at::Tensor> &attn_sink,
     const std::optional<at::Tensor> &topk_length) {
-    return sparse_attn_prefill_impl<true>(q, kv, indices, sm_scale, d_v, attn_sink, topk_length);
+  return sparse_attn_prefill_impl<true>(q, kv, indices, sm_scale, d_v,
+                                        attn_sink, topk_length);
 }
 
 #ifndef FLASH_MLA_LIBTORCH_ONLY
 void register_sparse_prefill(pybind11::module_& m) {
-    m.def("fp4_sparse_prefill_fwd", &fp4_sparse_attn_prefill_interface,
+  m.def("fp4_sparse_prefill_fwd", &fp4_sparse_attn_prefill_interface,
         "Run opt-in FP4 BF16 sparse prefill on SM90");
-    m.def("sparse_prefill_fwd",
-        &sparse_attn_prefill_interface,
+  m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface,
         "Run Sparse Attention Prefill Forward");
 }
 #endif

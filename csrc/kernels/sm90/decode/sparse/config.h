@@ -9,6 +9,7 @@
 #include <kerutils/kerutils.cuh>
 
 #include "kernels/defines.h"
+#include "kernels/kv_cache_format.h"
 #include "kernels/params.h"
 
 using namespace cute;
@@ -26,19 +27,23 @@ struct RemnantScratchStorage<true, NUM_K_BUFS, ROWS, PREFIX_STRIDE> {
     uint8_t scales[NUM_K_BUFS][ROWS * 8];
 };
 
-// Author: Winston Cai. Transient staging only; persistent Packed FP4 stays224 B.
-template <bool ENABLED, int BUFS, int ROWS>
-struct FP4ScratchStorage {};
+// Author: Winston Cai. Transient staging only; persistent Packed FP4 stays224
+// B.
+template <bool ENABLED, int BUFS, int ROWS> struct FP4ScratchStorage {};
 
-template <int BUFS, int ROWS>
-struct FP4ScratchStorage<true, BUFS, ROWS> {
-    CUTE_ALIGNAS(16) uint8_t codes[BUFS][ROWS * 144]; //128 payload +16 zero guard
-    CUTE_ALIGNAS(8) uint64_t bitmaps[BUFS][ROWS * 8];
-    uint16_t prefixes[BUFS][ROWS * 9];
-    uint8_t scales[BUFS][ROWS * 32];
+template <int BUFS, int ROWS> struct FP4ScratchStorage<true, BUFS, ROWS> {
+  CUTE_ALIGNAS(16)
+  uint8_t
+      codes[BUFS]
+           [ROWS * PackedFP4CacheFormat::GUARDED_VALUE_BYTES]; // 128 payload
+                                                               // +16 zero guard
+  CUTE_ALIGNAS(8) uint64_t bitmaps[BUFS][ROWS * 8];
+  uint16_t prefixes[BUFS][ROWS * PackedFP4CacheFormat::PREFIX_COUNT];
+  uint8_t scales[BUFS][ROWS * PackedFP4CacheFormat::SCALE_BYTES];
 };
 
-template<ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false, int EXTRA_FP4 = 0>
+template <ModelType MODEL_TYPE, int NUM_HEADS, bool REMNANT = false,
+          int EXTRA_FP4 = 0>
 class KernelTemplate {
 public:
 
@@ -351,7 +356,5 @@ static __device__ __forceinline__ void
 devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params);
 
 static void run(const SparseAttnDecodeParams &params);
-
 };
-
 }
