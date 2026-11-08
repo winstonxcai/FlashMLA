@@ -226,7 +226,6 @@ static __forceinline__ __device__ void store_o(
     int warpgroup_idx,
     int idx_in_warpgroup
 ) {
-    using cutlass::arch::NamedBarrier;
     if constexpr (IS_NO_SPLIT) {
         // Should convert the output to bfloat16 / float16, and save it to O
         // Here we don't pipeline STSM and tma store because it's slower
@@ -259,7 +258,7 @@ static __forceinline__ __device__ void store_o(
         }
 
         cutlass::arch::fence_view_async_shared();
-        NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
+        consumer_barrier_sync<NamedBarriers::epilogue_r2s_ready>();
 
         if (threadIdx.x == 0) {
             SM90_TMA_STORE_5D::copy(
@@ -283,7 +282,7 @@ static __forceinline__ __device__ void store_o(
         }
         cutlass::arch::fence_view_async_shared();
         
-        NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
+        consumer_barrier_sync<NamedBarriers::epilogue_r2s_ready>();
         
         if (elect_one_sync()) {
             CUTLASS_PRAGMA_UNROLL
