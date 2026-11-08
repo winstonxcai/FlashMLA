@@ -144,12 +144,40 @@ enum NamedBarriers : uint32_t {
 };
 
 
+// Author: Winston Cai. V4 consumers rendezvous from divergent warpgroup paths.
+// Use unaligned PTX barriers with the existing 256-thread participant count.
+template<uint32_t ID>
+static __forceinline__ __device__ void consumer_barrier_sync() {
+    if constexpr (MODEL_TYPE == ModelType::V4) {
+        asm volatile("barrier.sync %0, 256;" :: "n"(ID + static_cast<uint32_t>(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier)) : "memory");
+    } else {
+        cutlass::arch::NamedBarrier::arrive_and_wait(256, ID);
+    }
+}
+template<uint32_t ID>
+static __forceinline__ __device__ void consumer_barrier_arrive() {
+    if constexpr (MODEL_TYPE == ModelType::V4) {
+        asm volatile("barrier.arrive %0, 256;" :: "n"(ID + static_cast<uint32_t>(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier)) : "memory");
+    } else {
+        cutlass::arch::NamedBarrier::arrive(256, ID);
+    }
+}
+
 // Synchronize all threads within the cluster (which processes one q token)
 static __forceinline__ __device__ void sync_all_threads_in_cluster() {
     if constexpr (CLUSTER_SIZE == 1) {
-        __syncthreads();
+        if constexpr (MODEL_TYPE == ModelType::V4) {
+            asm volatile("barrier.sync 0, %0;" :: "n"(NUM_THREADS) : "memory");
+        } else {
+            __syncthreads();
+        }
     } else {
-        ku::barrier_cluster_arrive_relaxed();
+        // Publish shared-memory accesses before the next request reuses the union.
+        if constexpr (MODEL_TYPE == ModelType::V4) {
+            ku::barrier_cluster_arrive_release();
+        } else {
+            ku::barrier_cluster_arrive_relaxed();
+        }
         ku::barrier_cluster_wait_acquire();
     }
 }

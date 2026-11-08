@@ -240,7 +240,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 
                 // Calculate S = softmax(mask(scale(P)))
                 if (block_idx != args.start_block_idx)
-                    NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);  // Make sure that sScale and sS is free
+                    consumer_barrier_sync<NamedBarriers::sScale_and_sS_free>();  // Make sure that sScale and sS is free
 
                 // Since in our case TOPK_BLOCK_SIZE == BLOCK_M, so we only need to do OOB checking for the last 2 blocks
                 scale_softmax(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
@@ -257,7 +257,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     rO
                 );
 
-                NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_ready);
+                consumer_barrier_arrive<NamedBarriers::sScale_and_sS_ready>();
 
                 cute::warpgroup_wait<0>();
 
@@ -316,7 +316,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             // This is a synchronization point for warpgroup 0/1.
             // Warpgroup 0 should wait wg 1 for oBuf/oAccumBuf (overlapped with k) to be free
             // Warpgroup 1 should wait wg 0 for sL to be ready
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
+            consumer_barrier_sync<NamedBarriers::oBuf_free_and_sL_ready>();
 
             CUTE_UNROLL
             for (int i = 0; i < 2; ++i)
@@ -380,8 +380,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
                 Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
 
+                // Author: Winston Cai. Both consumers acquire KV completion directly;
+                // the S-ready handoff alone does not establish peer KV lifetime.
+                if constexpr (MODEL_TYPE == ModelType::V4) {
+                    plan.bar_k_local_ready[buf_idx].wait((bar_phase_k >> buf_idx) & 1);
+                    if constexpr (CLUSTER_SIZE == 2) {
+                        plan.bar_k_remote_ready[buf_idx].wait((bar_phase_k >> buf_idx) & 1);
+                    }
+                    bar_phase_k ^= 1 << buf_idx;
+                }
                 // Wait for S and sScale
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_ready);
+                consumer_barrier_sync<NamedBarriers::sScale_and_sS_ready>();
 
                 // Scale O
                 float cur_scales[2];
@@ -412,10 +421,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 }
                 
                 if (block_idx != args.end_block_idx-1)
-                    NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_free);   // Tell WG0 that sScale and sS are available
+                    consumer_barrier_arrive<NamedBarriers::sScale_and_sS_free>();   // Tell WG0 that sScale and sS are available
             }
 
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
+            consumer_barrier_sync<NamedBarriers::oBuf_free_and_sL_ready>();
 
             float o_scales[2];
             CUTE_UNROLL
