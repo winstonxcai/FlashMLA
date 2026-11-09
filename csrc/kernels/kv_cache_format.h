@@ -2,6 +2,10 @@
 
 #include "params.h"
 
+// Author: Winston Cai. Native/Packed opt into SM90 FP4; Stock keeps existing
+// dispatch, including the upstream SM100 formats.
+enum class FP4DecodeMode { Stock, Native, Packed };
+
 // Layout of paged quantized KV cache. A page block holds page_block_size tokens as two byte arrays, one row per token:
 //   [page_block_size, TMA_K_STRIDE]                        token data: D_FP4 / 2 + D_FP8 bytes of quantized values,
 //                                                          then the D_BF16 bf16 (RoPE) values of V3.2 / V4
@@ -32,6 +36,25 @@ struct KVCacheFormat {
     // detect_kv_cache_format_for_headdim_512 reads 528 as V4.1 unless the caller names the format (see its callers)
     static constexpr int BYTES_PER_TOKEN = TMA_K_STRIDE + (IS_V32 ? 0 : NUM_SCALES_EACH_TOKEN * SCALE_BYTES);
 };
+
+// Author: Winston Cai. Persistent Packed FP4 shares Native's quantization;
+// only coordinate storage differs. The SoA scale plane follows all data rows.
+struct PackedFP4CacheFormat {
+  using Native = KVCacheFormat<ModelType::V41_FP4>;
+  static constexpr int HEAD_DIM = Native::D_QK;
+  static constexpr int SURVIVORS = HEAD_DIM / 2;
+  static constexpr int VALUE_BYTES = SURVIVORS / 2;
+  static constexpr int BITMAP_WORDS = HEAD_DIM / 64;
+  static constexpr int BITMAP_BYTES = BITMAP_WORDS * sizeof(uint64_t);
+  static constexpr int DATA_BYTES = VALUE_BYTES + BITMAP_BYTES;
+  static constexpr int SCALE_BYTES = Native::NUM_SCALES_EACH_TOKEN;
+  static constexpr int BYTES_PER_TOKEN = DATA_BYTES + SCALE_BYTES;
+  static constexpr int ALIGNMENT = 16;
+  static constexpr int GUARDED_VALUE_BYTES = VALUE_BYTES + ALIGNMENT;
+  static constexpr int PREFIX_COUNT = BITMAP_WORDS + 1;
+};
+static_assert(KVCacheFormat<ModelType::V41_FP4>::BYTES_PER_TOKEN == 288);
+static_assert(PackedFP4CacheFormat::BYTES_PER_TOKEN == 224);
 
 // Runtime counterpart of KVCacheFormat<MT>::BYTES_PER_TOKEN
 constexpr int kv_cache_bytes_per_token(ModelType mt) {

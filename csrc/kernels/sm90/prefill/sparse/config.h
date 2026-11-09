@@ -1,3 +1,5 @@
+// Author: Winston Cai. Opt-in FP4 prefill barrier policy; stock default
+// retained.
 #pragma once
 
 #include <math_constants.h>
@@ -15,7 +17,7 @@ namespace sm90::prefill::sparse_fwd {
 
 using namespace cute;
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
+template <int D_QK, bool HAVE_TOPK_LENGTH, bool FP4_PREFILL = false>
 class KernelTemplate {
 public:
 
@@ -140,8 +142,5 @@ static __device__ __forceinline__ void
 devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params);
 
 static void run(const SparseAttnFwdParams &params);
-
 };
-
-
 };
