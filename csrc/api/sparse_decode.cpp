@@ -89,7 +89,8 @@ protected:
     }
 };
 
-template <int FORMAT> class Decode_Sm90_FP4_Impl : public DecodeImplBase {
+template <FP4DecodeMode FP4_MODE>
+class Decode_Sm90_FP4_Impl : public DecodeImplBase {
   DECLARE_SUPPORTED_FEATURES(DecodeFeatures::HEAD_64, DecodeFeatures::HEAD_128,
                              DecodeFeatures::HEAD_DIM_512,
                              DecodeFeatures::V4_KVCACHE_FORMAT,
@@ -108,7 +109,7 @@ protected:
             const std::vector<FeatureT> &) override {
     DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
       sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<
-          ModelType::V4, NUM_HEADS, false, FORMAT>(params);
+          ModelType::V4, NUM_HEADS, false, FP4_MODE>(params);
     });
   }
 };
@@ -279,7 +280,7 @@ protected:
 };
 #endif
 
-template <bool REMNANT, int EXTRA_FP4 = 0>
+template <bool REMNANT, FP4DecodeMode FP4_MODE = FP4DecodeMode::Stock>
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>,
                   std::optional<at::Tensor>>
 sparse_attn_decode_interface_impl(
@@ -452,7 +453,7 @@ sparse_attn_decode_interface_impl(
     } else if (d_qk == 512 && d_v == 512) {
         model_type = kv_format_hint.value_or(detect_kv_cache_format_for_headdim_512(kv.size(3), kv_format_hint));
         extra_model_type =
-            EXTRA_FP4 != 0
+            FP4_MODE != FP4DecodeMode::Stock
                 ? ModelType::V41_FP4
                 : (have_extra_kcache ? detect_kv_cache_format_for_headdim_512(
                                            extra_kv->size(3), model_type)
@@ -466,19 +467,20 @@ sparse_attn_decode_interface_impl(
     }
     TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
     TORCH_CHECK(
-        (EXTRA_FP4 != 0 && model_type == ModelType::V4 && have_extra_kcache) ||
+        (FP4_MODE != FP4DecodeMode::Stock && model_type == ModelType::V4 &&
+         have_extra_kcache) ||
             is_valid_kv_format_pair(model_type, extra_model_type),
         "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ",
         get_dynamic_enum_name(extra_model_type));
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_cache_bytes_per_token(model_type));
     KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv,
-                   (EXTRA_FP4 == 2
+                   (FP4_MODE == FP4DecodeMode::Packed
                         ? PackedFP4CacheFormat::BYTES_PER_TOKEN
                         : kv_cache_bytes_per_token(extra_model_type)));
     TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous when is_fp8_cache is True for kv cache");
     if (have_extra_kcache) {
       TORCH_CHECK(extra_kv->stride(1) ==
-                      (EXTRA_FP4 == 2
+                      (FP4_MODE == FP4DecodeMode::Packed
                            ? PackedFP4CacheFormat::BYTES_PER_TOKEN
                            : kv_cache_bytes_per_token(extra_model_type)),
                   "The whole block must be contiguous when is_fp8_cache is "
@@ -544,7 +546,7 @@ sparse_attn_decode_interface_impl(
     }
 
     DecodeImplBase* impl;
-    if constexpr (EXTRA_FP4 != 0) {
+    if constexpr (FP4_MODE != FP4DecodeMode::Stock) {
       TORCH_CHECK(arch.is_sm90a(), "V4.1 FP4 Direct requires SM90a");
       TORCH_CHECK(model_type == ModelType::V4 && have_extra_kcache,
                   "FP4 Direct requires V4 SWA and a global FP4 cache");
@@ -555,7 +557,7 @@ sparse_attn_decode_interface_impl(
       TORCH_CHECK(
           extra_kv->stride(0) >=
                   extra_page_block_size *
-                      (EXTRA_FP4 == 2
+                      (FP4_MODE == FP4DecodeMode::Packed
                            ? PackedFP4CacheFormat::BYTES_PER_TOKEN
                            : KVCacheFormat<
                                  ModelType::V41_FP4>::BYTES_PER_TOKEN) &&
@@ -567,7 +569,7 @@ sparse_attn_decode_interface_impl(
                       0,
                   "FP4 Direct cache base must be 16-byte aligned; copy "
                   "storage-offset views into aligned storage");
-      impl = new Decode_Sm90_FP4_Impl<EXTRA_FP4>();
+      impl = new Decode_Sm90_FP4_Impl<FP4_MODE>();
     } else if constexpr (REMNANT) {
       TORCH_CHECK(arch.is_sm90a(),
                   "Remnant direct decode currently requires SM90a");
@@ -801,11 +803,11 @@ sparse_attn_decode_fp4_interface(
     float sm_scale) {
   std::optional<at::Tensor> metadata, splits;
   if (packed)
-    return sparse_attn_decode_interface_impl<false, 2>(
+    return sparse_attn_decode_interface_impl<false, FP4DecodeMode::Packed>(
         q, kv, indices, topk_length, attn_sink, metadata, splits, extra_kv,
         extra_indices, extra_topk_length, 512, sm_scale, std::string("V4"),
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
-  return sparse_attn_decode_interface_impl<false, 1>(
+  return sparse_attn_decode_interface_impl<false, FP4DecodeMode::Native>(
       q, kv, indices, topk_length, attn_sink, metadata, splits, extra_kv,
       extra_indices, extra_topk_length, 512, sm_scale, std::string("V4"),
       std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
